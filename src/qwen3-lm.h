@@ -213,6 +213,10 @@ static void qw3lm_alloc_kv_cache(Qwen3LM * m, int n_sets) {
         fprintf(stderr, "[LM-KV] FATAL: failed to allocate KV cache\n");
         exit(1);
     }
+    // Zero the cache: bucketed decode reads positions past each element's real
+    // kv_len. Those are masked to -inf, but zeroing guards against NaN from
+    // inf*0 had the backend buffer contained garbage on first use.
+    ggml_backend_buffer_clear(m->kv_buf, 0);
 
     size_t kv_bytes = (size_t) n_sets * L * 2 * D * S * Nkv * ggml_type_size(GGML_TYPE_F16);
     fprintf(stderr, "[LM-KV] Allocated %d sets x %d layers (4D batched), %.1f MB\n", n_sets, L,
@@ -575,7 +579,29 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
         }
     }
 
-    // Graph context (generous fixed allocation, ~6 MB, negligible vs model weights)
+    // Round the KV-read length up to a fixed stride. The CUDA flash-attn decode
+    // kernel has a fast path that engages at 256-aligned KV length: padding the
+    // read to 256 is ~17% faster than a ragged length, even though it reads more
+    // positions (measured: 18.4ms ragged -> 15.7ms @256, no further gain @512).
+    // The attn_mask below sets positions beyond each element's real kv_len to -inf,
+    // so the padded tail is numerically inert. NOTE: bucketing changes flash-attn
+    // FP rounding (different block accumulation), so at temp=0 greedy a borderline
+    // argmax can flip and the generation diverges from the unbucketed result. It is
+    // a different-but-equivalent sample (invisible at temp>0 with random seed), not
+    // a quality regression. Set ACE_KV_BUCKET=1 for bit-identical-but-slower decode.
+    static const int KV_BUCKET = []() { const char * e = getenv("ACE_KV_BUCKET"); return e ? atoi(e) : 256; }();
+    int kv_read_len = (KV_BUCKET <= 1) ? max_kv_len : ((max_kv_len + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET;
+    if (kv_read_len > c.max_seq_len) {
+        kv_read_len = c.max_seq_len;
+    }
+
+    // [profile] env-gated phase timing (ACE_LM_PROFILE=1)
+    static int64_t _acc_build = 0, _acc_alloc = 0, _acc_comp = 0, _acc_read = 0;
+    static int     _acc_n     = 0;
+    static bool    _prof      = getenv("ACE_LM_PROFILE") != NULL;
+    int64_t        _tb0       = _prof ? ggml_time_us() : 0;
+
+    // Graph context (fixed allocation, ~6 MB, negligible vs model weights).
     size_t ctx_size             = (size_t) 16384 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false);
     struct ggml_init_params gp  = { ctx_size, NULL, true };
     struct ggml_context *   ctx = ggml_init(gp);
@@ -591,9 +617,9 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
 
-    // Batched attention mask: [max_kv_len, 1, 1, N] f16
+    // Batched attention mask: [kv_read_len, 1, 1, N] f16
     // Per-element: 0 for valid KV positions, -inf for padding beyond elem kv_len
-    struct ggml_tensor * attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, max_kv_len, 1, 1, N);
+    struct ggml_tensor * attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_read_len, 1, 1, N);
     ggml_set_name(attn_mask, "attn_mask");
     ggml_set_input(attn_mask);
 
@@ -679,13 +705,13 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
         // Q: [D, Nh, N] -> [D, 1, Nh, N] (n_batch=1, ne3=N for batched flash_attn)
         struct ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
 
-        // Batched KV read: [D, max_kv_len, Nkv, N] view of 4D cache
+        // Batched KV read: [D, kv_read_len, Nkv, N] view of 4D cache
         int                  s0 = kv_sets[0];  // sets are always consecutive: [s0, s0+1, ..., s0+N-1]
         struct ggml_tensor * k_batch =
-            ggml_view_4d(ctx, m->kv_k4[l], D, max_kv_len, Nkv, N, m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
+            ggml_view_4d(ctx, m->kv_k4[l], D, kv_read_len, Nkv, N, m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
                          m->kv_k4[l]->nb[3], (size_t) s0 * m->kv_k4[l]->nb[3]);
         struct ggml_tensor * v_batch =
-            ggml_view_4d(ctx, m->kv_v4[l], D, max_kv_len, Nkv, N, m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
+            ggml_view_4d(ctx, m->kv_v4[l], D, kv_read_len, Nkv, N, m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
                          m->kv_v4[l]->nb[3], (size_t) s0 * m->kv_v4[l]->nb[3]);
 
         // Batched attention (flash or F32 manual fallback)
@@ -732,6 +758,7 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     ggml_build_forward_expand(gf, lgt);
 
     // Allocate
+    int64_t _ta0 = _prof ? ggml_time_us() : 0;
     if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
         fprintf(stderr, "[LM] FATAL: failed to allocate graph (batch decode, N=%d)\n", N);
         exit(1);
@@ -752,18 +779,20 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     // Attention mask: [max_kv_len, 1, 1, N] f16
     // 0.0 for valid KV positions, -inf for padding beyond each element's kv_len
     {
-        std::vector<uint16_t> mask_data((size_t) max_kv_len * N);
+        std::vector<uint16_t> mask_data((size_t) kv_read_len * N);
         for (int i = 0; i < N; i++) {
             int kvl = m->kv_pos[kv_sets[i]] + 1;  // kv_len after write
-            for (int j = 0; j < max_kv_len; j++) {
-                mask_data[(size_t) i * max_kv_len + j] = ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
+            for (int j = 0; j < kv_read_len; j++) {
+                mask_data[(size_t) i * kv_read_len + j] = ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
             }
         }
         ggml_backend_tensor_set(attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(uint16_t));
     }
 
     // Compute
+    int64_t _tc0 = _prof ? ggml_time_us() : 0;
     ggml_backend_sched_graph_compute(m->sched, gf);
+    int64_t _tr0 = _prof ? ggml_time_us() : 0;
 
     // Read logits [out_V, N]
     ggml_backend_tensor_get(lgt, logits, 0, (size_t) out_V * N * sizeof(float));
@@ -775,6 +804,22 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
 
     ggml_backend_sched_reset(m->sched);
     ggml_free(ctx);
+
+    if (_prof) {
+        int64_t _te = ggml_time_us();
+        _acc_build += _ta0 - _tb0;   // ctx init + graph construction
+        _acc_alloc += _tc0 - _ta0;   // sched alloc + input upload
+        _acc_comp  += _tr0 - _tc0;   // graph compute
+        _acc_read  += _te - _tr0;    // readback + reset + free
+        if (++_acc_n % 100 == 0) {
+            double n = _acc_n;
+            fprintf(stderr,
+                    "[LM-PROF] %d steps (N=%d) avg/step: build=%.2fms alloc+up=%.2fms compute=%.2fms read=%.2fms | total=%.2fms\n",
+                    _acc_n, N, _acc_build / 1000.0 / n, _acc_alloc / 1000.0 / n, _acc_comp / 1000.0 / n,
+                    _acc_read / 1000.0 / n,
+                    (_acc_build + _acc_alloc + _acc_comp + _acc_read) / 1000.0 / n);
+        }
+    }
 }
 
 // Free all resources
