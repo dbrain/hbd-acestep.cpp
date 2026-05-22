@@ -196,6 +196,10 @@ static AceUnderstandParams g_und_params;
 // limits
 static int  g_max_batch   = 1;
 static bool g_keep_loaded = false;
+// Dynamic KV: 0 = off (alloc the static max_batch × max_seq every request).
+// >0 = right-size the LM KV cache per request to (batch × seq) where seq is
+// derived from the request's duration, capped so batch × seq <= g_kv_budget.
+static int g_kv_budget = 0;
 
 // job system: all compute endpoints create a job and return its ID
 // immediately. the worker thread processes jobs in FIFO order, stores
@@ -563,6 +567,36 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
     }
     AceLmParams p = g_lm_params;
     p.model_path  = entry->path.c_str();
+
+    // Dynamic KV sizing: the KV cache is the LM's attention memory, allocated
+    // up front, so right-size it to THIS request instead of the global
+    // max_batch × max_seq. duration>0 → size to the code-sketch length
+    // (~5 tok/s) + a generous lyric/CoT/prompt margin; duration=0 (LM picks,
+    // FSM-capped at 600s) → the FSM bound. To respect g_kv_budget we clip the
+    // BATCH (song count), never the per-sequence length: under-allocating seq
+    // would let the LM overrun the KV mid-decode and abort. So a multi-song
+    // request for a long song yields fewer songs rather than crashing. Under
+    // STRICT the LM reloads per request anyway, so this is free.
+    if (g_kv_budget > 0) {
+        int want = (ace_req.duration > 0.0f) ? (int) (ace_req.duration * 5.0f) + 2048 : 4096;
+        if (want > g_lm_params.max_seq) {
+            want = g_lm_params.max_seq;
+        }
+        if (want < 512) {
+            want = 512;
+        }
+        int max_fit = g_kv_budget / want;
+        if (max_fit < 1) {
+            max_fit = 1;
+        }
+        if (lm_batch_size > max_fit) {
+            lm_batch_size = max_fit;  // fewer songs, never an overrun
+        }
+        p.max_seq   = want;
+        p.max_batch = lm_batch_size;
+        fprintf(stderr, "[LM-KV] dynamic: batch=%d seq=%d (duration=%.0fs, budget=%d)\n", lm_batch_size,
+                want, ace_req.duration, g_kv_budget);
+    }
 
     // Acquire a fresh LM ctx from the shared store. Under EVICT_STRICT the
     // module is reloaded if another pipeline evicted it; under EVICT_NEVER
@@ -1068,6 +1102,20 @@ static void understand_worker(std::shared_ptr<Job> job,
     p.model_path          = lm_entry->path.c_str();
     p.dit_path            = dit->path.c_str();
     p.vae_path            = vae_entry->path.c_str();
+
+    // Dynamic KV (understand is always batch-1). The source length isn't known
+    // until VAE-encode, so size to the FSM bound (~600s) capped by the budget.
+    if (g_kv_budget > 0) {
+        int want = 4096;
+        if (want > g_und_params.max_seq) {
+            want = g_und_params.max_seq;
+        }
+        if (want > g_kv_budget) {
+            want = g_kv_budget;
+        }
+        p.max_seq   = want;
+        p.max_batch = 1;
+    }
 
     AceUnderstand * ctx = ace_understand_load(g_store, &p);
     if (!ctx) {
@@ -1635,6 +1683,8 @@ int main(int argc, char ** argv) {
             port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--max-batch") && i + 1 < argc) {
             g_max_batch = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--kv-budget") && i + 1 < argc) {
+            g_kv_budget = atoi(argv[++i]);
 
             // debug
         } else if (!strcmp(argv[i], "--no-fsm")) {
