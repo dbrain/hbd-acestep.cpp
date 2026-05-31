@@ -77,6 +77,11 @@
 #        define STDERR_FILENO 2
 #    endif
 #else
+#    include <cerrno>
+#    include <fcntl.h>
+#    include <sys/socket.h>
+#    include <sys/uio.h>
+#    include <sys/wait.h>
 #    include <unistd.h>
 #endif
 
@@ -230,6 +235,60 @@ static std::mutex                                            mtx_jobs;
 static std::unordered_map<std::string, std::shared_ptr<Job>> g_jobs;
 static std::deque<std::string>                               g_job_order;
 static const int                                             MAX_JOBS = 32;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Worker isolation (fork + IPC; parent CUDA-free, child owns the CUDA context)
+// ───────────────────────────────────────────────────────────────────────────
+// Built into ace-server like qwen3-tts.cpp / siglip2.cpp / the matting server:
+// when ACE_WORKER_ISOLATION=1 the GPU pipelines run in a forked `--worker` child.
+// The parent is just the HTTP front-end + job table and holds NO CUDA context;
+// SIGKILL'ing the child (on /unload or idle-unload) reclaims 100% of VRAM
+// (true-0, incl. the CUDA primary context). Without the env var the server stays
+// fully in-process (the legacy path), so isolation can be toggled by env alone.
+static bool g_isolation = false;  // parent: forward jobs to the worker child
+
+static long long now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// run_* dispatch wrappers — drop-in replacements for the *_worker calls in the
+// handler work_push closures (identical signatures). Under isolation they marshal
+// the job to the worker child and block for its result; otherwise they call the
+// in-process *_worker directly.
+static void run_lm(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch_size, int mode);
+static void run_synth(std::shared_ptr<Job>    job,
+                      std::vector<AceRequest> ace_reqs,
+                      float *                 src_interleaved,
+                      int                     src_len,
+                      std::vector<float>      src_latents,
+                      int                     src_T_latent,
+                      float *                 ref_interleaved,
+                      int                     ref_len,
+                      std::vector<float>      ref_latents,
+                      int                     ref_T_latent,
+                      bool                    output_wav,
+                      WavFormat               wav_fmt,
+                      int                     peak_clip);
+static void run_understand(std::shared_ptr<Job> job,
+                           AceRequest           ace_req,
+                           float *              src_interleaved,
+                           int                  src_len,
+                           std::vector<float>   src_latents,
+                           int                  src_T_latent);
+static void run_encode(std::shared_ptr<Job> job, AceRequest ace_req, float * src_interleaved, int src_len);
+static void run_decode(std::shared_ptr<Job> job,
+                       AceRequest           ace_req,
+                       std::vector<float>   src_latents,
+                       int                  src_T_latent,
+                       bool                 output_wav,
+                       WavFormat            wav_fmt,
+                       int                  peak_clip);
+
+// parent-side worker controls (no-ops when not isolated / not POSIX)
+static void worker_forward_cancel();  // /job?cancel  -> CANCEL frame to the child
+static void worker_unload();          // /unload, idle watchdog, shutdown -> SIGKILL child
+static void worker_touch();           // mark activity (keeps the worker warm)
 
 // Source latent cap: matches the silence_latent tensor baked into the DiT
 // GGUF, which is fixed at [15000, 64] f32. The pipeline indexes into it
@@ -696,7 +755,7 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
 
     request_resolve_lm_seed(&ace_req);
 
-    work_push([job, ace_req, lm_batch_size, mode]() { lm_worker(job, ace_req, lm_batch_size, mode); });
+    work_push([job, ace_req, lm_batch_size, mode]() { run_lm(job, ace_req, lm_batch_size, mode); });
 
     std::string body = "{\"id\":\"" + job->id + "\"}";
     res.set_content(body, "application/json");
@@ -1061,8 +1120,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     work_push([job, reqs = std::move(ace_reqs), src_interleaved, src_len, src_lat = std::move(src_latents),
                src_T_latent, ref_interleaved, ref_len, ref_lat = std::move(ref_latents), ref_T_latent, output_wav,
                wav_fmt, peak_clip]() mutable {
-        synth_worker(job, std::move(reqs), src_interleaved, src_len, std::move(src_lat), src_T_latent, ref_interleaved,
-                     ref_len, std::move(ref_lat), ref_T_latent, output_wav, wav_fmt, peak_clip);
+        run_synth(job, std::move(reqs), src_interleaved, src_len, std::move(src_lat), src_T_latent, ref_interleaved,
+                  ref_len, std::move(ref_lat), ref_T_latent, output_wav, wav_fmt, peak_clip);
     });
 
     // return job ID immediately
@@ -1248,7 +1307,7 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     request_resolve_lm_seed(&ace_req);
 
     work_push([job, ace_req, src_interleaved, src_len, latents = std::move(src_latents), src_T_latent]() mutable {
-        understand_worker(job, ace_req, src_interleaved, src_len, std::move(latents), src_T_latent);
+        run_understand(job, ace_req, src_interleaved, src_len, std::move(latents), src_T_latent);
     });
 
     std::string body = "{\"id\":\"" + job->id + "\"}";
@@ -1491,7 +1550,7 @@ static void handle_vae(const httplib::Request & req, httplib::Response & res) {
                 (float) src_len / 48000.0f);
 
         work_push([job, ace_req, src_interleaved, src_len]() mutable {
-            encode_worker(job, ace_req, src_interleaved, src_len);
+            run_encode(job, ace_req, src_interleaved, src_len);
         });
 
         std::string body = "{\"id\":\"" + job->id + "\"}";
@@ -1528,7 +1587,7 @@ static void handle_vae(const httplib::Request & req, httplib::Response & res) {
     fprintf(stderr, "[Server] Job %s created (vae decode, %d latent frames)\n", job->id.c_str(), T);
 
     work_push([job, ace_req, latents = std::move(src_latents), T, output_wav, wav_fmt, peak_clip]() mutable {
-        decode_worker(job, ace_req, std::move(latents), T, output_wav, wav_fmt, peak_clip);
+        run_decode(job, ace_req, std::move(latents), T, output_wav, wav_fmt, peak_clip);
     });
 
     std::string body = "{\"id\":\"" + job->id + "\"}";
@@ -1611,6 +1670,684 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     free(json);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Worker-isolation implementation (fork + length-prefixed IPC over AF_UNIX).
+// Frame shape mirrors qwen3-tts.cpp / the matting server: 12-byte header then a
+// payload. A DATA socket carries RUN/RESULT/HELLO; a CONTROL socket carries
+// CANCEL so it reaches the (busy, single-threaded) child mid-render.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Saved for re-exec of self in `--worker` mode.
+static int           g_argc        = 0;
+static char **       g_argv        = nullptr;
+static bool          g_worker_mode = false;  // this process is the forked child
+static int           g_worker_data_fd = -1;
+static int           g_worker_ctrl_fd = -1;
+static int           g_idle_unload_seconds = 60;  // child SIGKILL'd after N idle s (0 = ASAP)
+
+// Marshalled job kinds.
+enum AceJobKind : uint32_t {
+    JOB_LM     = 1,
+    JOB_SYNTH  = 2,
+    JOB_UND    = 3,
+    JOB_ENC    = 4,
+    JOB_DEC    = 5,
+};
+
+// Pack helpers (append little-endian; the parent and child share endianness).
+static void pk_u32(std::string & b, uint32_t v) { b.append(reinterpret_cast<const char *>(&v), 4); }
+static void pk_i32(std::string & b, int32_t v) { b.append(reinterpret_cast<const char *>(&v), 4); }
+static void pk_u8(std::string & b, uint8_t v) { b.append(reinterpret_cast<const char *>(&v), 1); }
+static void pk_str(std::string & b, const std::string & s) {
+    pk_u32(b, (uint32_t) s.size());
+    b.append(s);
+}
+static void pk_floats(std::string & b, const float * p, size_t n) {
+    pk_u32(b, (uint32_t) n);
+    if (n) {
+        b.append(reinterpret_cast<const char *>(p), n * sizeof(float));
+    }
+}
+
+// Cursor reader over a received payload. Bounds-checked: on overrun it clamps to
+// empty/zero so a malformed frame degrades to a failed job rather than an OOB read.
+struct Rd {
+    const uint8_t * p;
+    size_t          n;
+    size_t          off = 0;
+    bool            ok  = true;
+
+    bool need(size_t k) {
+        if (off + k > n) {
+            ok = false;
+            return false;
+        }
+        return true;
+    }
+    uint32_t u32() {
+        if (!need(4)) {
+            return 0;
+        }
+        uint32_t v;
+        std::memcpy(&v, p + off, 4);
+        off += 4;
+        return v;
+    }
+    int32_t i32() {
+        if (!need(4)) {
+            return 0;
+        }
+        int32_t v;
+        std::memcpy(&v, p + off, 4);
+        off += 4;
+        return v;
+    }
+    uint8_t u8() {
+        if (!need(1)) {
+            return 0;
+        }
+        return p[off++];
+    }
+    std::string str() {
+        uint32_t l = u32();
+        if (!need(l)) {
+            return std::string();
+        }
+        std::string s(reinterpret_cast<const char *>(p + off), l);
+        off += l;
+        return s;
+    }
+    std::vector<float> floats() {
+        uint32_t cnt = u32();
+        if (!need((size_t) cnt * sizeof(float))) {
+            return std::vector<float>();
+        }
+        std::vector<float> v(cnt);
+        if (cnt) {
+            std::memcpy(v.data(), p + off, (size_t) cnt * sizeof(float));
+        }
+        off += (size_t) cnt * sizeof(float);
+        return v;
+    }
+};
+
+#ifndef _WIN32
+
+// 12-byte frame header (matches the matting/qwen3-tts shape).
+enum class Frame : uint32_t {
+    HELLO    = 0x01,  // child->parent: ready (registry scanned, store created; CUDA still lazy)
+    RUN      = 0x10,  // parent->child: [u32 kind][marshalled inputs]
+    RESULT   = 0x11,  // child->parent: [i32 status][str mime][str body]
+    CANCEL   = 0x20,  // parent->child (CONTROL socket): cancel the active job
+};
+
+struct FrameHeader {
+    uint32_t type;
+    uint32_t len;
+    uint32_t req_id;
+};
+static_assert(sizeof(FrameHeader) == 12, "FrameHeader must stay 12 bytes");
+
+static constexpr size_t MAX_FRAME_PAYLOAD = 1024ull * 1024 * 1024;  // 1 GiB (10-min stereo WAV + latents)
+
+static bool io_read_exact(int fd, void * buf, size_t len) {
+    char * pp = static_cast<char *>(buf);
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = ::read(fd, pp + got, len - got);
+        if (r > 0) {
+            got += (size_t) r;
+            continue;
+        }
+        if (r == 0) {
+            return false;  // EOF
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool io_write_exact(int fd, const void * buf, size_t len) {
+    const char * pp = static_cast<const char *>(buf);
+    size_t       sent = 0;
+    while (sent < len) {
+        ssize_t w = ::write(fd, pp + sent, len - sent);
+        if (w > 0) {
+            sent += (size_t) w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool send_frame(int fd, Frame type, uint32_t req_id, const void * payload, size_t len) {
+    if (len > MAX_FRAME_PAYLOAD) {
+        return false;
+    }
+    FrameHeader hdr{ (uint32_t) type, (uint32_t) len, req_id };
+    if (!io_write_exact(fd, &hdr, sizeof(hdr))) {
+        return false;
+    }
+    if (len == 0) {
+        return true;
+    }
+    return io_write_exact(fd, payload, len);
+}
+
+static bool recv_frame(int fd, FrameHeader * hdr, std::vector<uint8_t> * payload) {
+    if (!io_read_exact(fd, hdr, sizeof(*hdr))) {
+        return false;
+    }
+    if (hdr->len > MAX_FRAME_PAYLOAD) {
+        return false;
+    }
+    payload->resize(hdr->len);
+    if (hdr->len == 0) {
+        return true;
+    }
+    return io_read_exact(fd, payload->data(), hdr->len);
+}
+
+// ── child side ──────────────────────────────────────────────────────────────
+// Points at the active job's cancel flag while a RUN is executing, so the
+// CONTROL-socket reader thread can trip cooperative cancellation mid-render.
+static std::atomic<std::atomic<bool> *> g_child_active_cancel{ nullptr };
+
+// Unpack a RUN payload and run the matching in-process *_worker against `job`.
+static void worker_dispatch(const std::vector<uint8_t> & payload, std::shared_ptr<Job> job) {
+    Rd       rd{ payload.data(), payload.size() };
+    uint32_t kind = rd.u32();
+
+    auto parse_req = [](const std::string & j) {
+        AceRequest r;
+        request_init(&r);
+        request_parse_json(&r, j.c_str());
+        return r;
+    };
+    // raw interleaved-stereo buffer the *_worker frees with free(): malloc a copy.
+    auto take_audio = [](std::vector<float> & v) -> float * {
+        if (v.empty()) {
+            return nullptr;
+        }
+        float * out = static_cast<float *>(malloc(v.size() * sizeof(float)));
+        if (out) {
+            std::memcpy(out, v.data(), v.size() * sizeof(float));
+        }
+        return out;
+    };
+
+    switch (kind) {
+        case JOB_LM: {
+            AceRequest req = parse_req(rd.str());
+            int        bs  = rd.i32();
+            int        md  = rd.i32();
+            lm_worker(job, std::move(req), bs, md);
+            break;
+        }
+        case JOB_SYNTH: {
+            uint32_t                nreq = rd.u32();
+            std::vector<AceRequest> reqs;
+            reqs.reserve(nreq);
+            for (uint32_t i = 0; i < nreq; i++) {
+                reqs.push_back(parse_req(rd.str()));
+            }
+            std::vector<float> src_a = rd.floats();
+            int                src_len = rd.i32();
+            std::vector<float> src_lat = rd.floats();
+            int                src_T   = rd.i32();
+            std::vector<float> ref_a   = rd.floats();
+            int                ref_len = rd.i32();
+            std::vector<float> ref_lat = rd.floats();
+            int                ref_T   = rd.i32();
+            bool               owav    = rd.u8() != 0;
+            WavFormat          wf       = (WavFormat) rd.i32();
+            int                pclip    = rd.i32();
+            if (!rd.ok) {
+                job->status.store(JobStatus::FAILED);
+                break;
+            }
+            synth_worker(job, std::move(reqs), take_audio(src_a), src_len, std::move(src_lat), src_T,
+                         take_audio(ref_a), ref_len, std::move(ref_lat), ref_T, owav, wf, pclip);
+            break;
+        }
+        case JOB_UND: {
+            AceRequest         req     = parse_req(rd.str());
+            std::vector<float> src_a   = rd.floats();
+            int                src_len = rd.i32();
+            std::vector<float> src_lat = rd.floats();
+            int                src_T   = rd.i32();
+            if (!rd.ok) {
+                job->status.store(JobStatus::FAILED);
+                break;
+            }
+            understand_worker(job, std::move(req), take_audio(src_a), src_len, std::move(src_lat), src_T);
+            break;
+        }
+        case JOB_ENC: {
+            AceRequest         req     = parse_req(rd.str());
+            std::vector<float> src_a   = rd.floats();
+            int                src_len = rd.i32();
+            if (!rd.ok) {
+                job->status.store(JobStatus::FAILED);
+                break;
+            }
+            encode_worker(job, std::move(req), take_audio(src_a), src_len);
+            break;
+        }
+        case JOB_DEC: {
+            AceRequest         req     = parse_req(rd.str());
+            std::vector<float> src_lat = rd.floats();
+            int                src_T   = rd.i32();
+            bool               owav    = rd.u8() != 0;
+            WavFormat          wf       = (WavFormat) rd.i32();
+            int                pclip    = rd.i32();
+            if (!rd.ok) {
+                job->status.store(JobStatus::FAILED);
+                break;
+            }
+            decode_worker(job, std::move(req), std::move(src_lat), src_T, owav, wf, pclip);
+            break;
+        }
+        default:
+            fprintf(stderr, "[worker] unknown job kind %u\n", kind);
+            job->status.store(JobStatus::FAILED);
+            break;
+    }
+}
+
+// Child entry: HELLO, spawn the CONTROL reader, then serve RUN frames until the
+// parent closes the DATA socket (or SIGKILL). Returns the process exit code.
+static int worker_run_loop() {
+    int data_fd = g_worker_data_fd;
+    int ctrl_fd = g_worker_ctrl_fd;
+
+    const char * hi = "{\"ok\":true}";
+    if (!send_frame(data_fd, Frame::HELLO, 0, hi, strlen(hi))) {
+        return 1;
+    }
+    fprintf(stderr, "[worker] pid=%d ready (CUDA loads lazily on first job)\n", (int) getpid());
+
+    std::thread reader([ctrl_fd]() {
+        for (;;) {
+            FrameHeader          hdr{};
+            std::vector<uint8_t> pl;
+            if (!recv_frame(ctrl_fd, &hdr, &pl)) {
+                break;  // parent gone
+            }
+            if ((Frame) hdr.type == Frame::CANCEL) {
+                std::atomic<bool> * c = g_child_active_cancel.load();
+                if (c) {
+                    c->store(true);
+                }
+            }
+        }
+    });
+    reader.detach();
+
+    for (;;) {
+        FrameHeader          hdr{};
+        std::vector<uint8_t> payload;
+        if (!recv_frame(data_fd, &hdr, &payload)) {
+            break;  // parent closed DATA socket -> exit (frees CUDA)
+        }
+        if ((Frame) hdr.type != Frame::RUN) {
+            continue;
+        }
+        auto job = std::make_shared<Job>();
+        job->id  = "worker";
+        g_child_active_cancel.store(&job->cancel);
+        worker_dispatch(payload, job);
+        g_child_active_cancel.store(nullptr);
+
+        std::string out;
+        pk_i32(out, (int32_t) job->status.load());
+        pk_str(out, job->result_mime);
+        pk_str(out, job->result_body);
+        if (!send_frame(data_fd, Frame::RESULT, hdr.req_id, out.data(), out.size())) {
+            break;
+        }
+    }
+
+    if (g_store) {
+        store_free(g_store);
+        g_store = nullptr;
+    }
+    return 0;
+}
+
+// ── parent side ─────────────────────────────────────────────────────────────
+static std::mutex             g_wk_mtx;                 // guards pid/fds + spawn/kill
+static pid_t                  g_wk_pid  = -1;
+static int                    g_wk_data = -1;
+static int                    g_wk_ctrl = -1;
+static std::atomic<bool>      g_wk_busy{ false };       // a RUN is in flight (don't idle-kill)
+static std::atomic<long long> g_wk_last_activity{ 0 };
+
+static void worker_touch() {
+    g_wk_last_activity.store(now_ms());
+}
+
+// fork + execv self with the original argv plus `--worker <datafd> --control <ctrlfd>`.
+// Returns child pid; sets *out_data/*out_ctrl to the parent ends. -1 on failure.
+static pid_t worker_spawn(int * out_data, int * out_ctrl) {
+    int dv[2], cv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, dv) != 0) {
+        return -1;
+    }
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, cv) != 0) {
+        ::close(dv[0]);
+        ::close(dv[1]);
+        return -1;
+    }
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(dv[0]);
+        ::close(dv[1]);
+        ::close(cv[0]);
+        ::close(cv[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        ::close(dv[0]);
+        ::close(cv[0]);
+        char dbuf[16], cbuf[16];
+        std::snprintf(dbuf, sizeof(dbuf), "%d", dv[1]);
+        std::snprintf(cbuf, sizeof(cbuf), "%d", cv[1]);
+        char wflag[] = "--worker";
+        char cflag[] = "--control";
+        std::vector<char *> a;
+        for (int i = 0; i < g_argc; i++) {
+            a.push_back(g_argv[i]);
+        }
+        a.push_back(wflag);
+        a.push_back(dbuf);
+        a.push_back(cflag);
+        a.push_back(cbuf);
+        a.push_back(nullptr);
+        ::execv(g_argv[0], a.data());
+        std::fprintf(stderr, "[Server] execv worker failed: %s\n", strerror(errno));
+        ::_exit(127);
+    }
+    ::close(dv[1]);
+    ::close(cv[1]);
+    int fl;
+    if ((fl = ::fcntl(dv[0], F_GETFD)) >= 0) {
+        ::fcntl(dv[0], F_SETFD, fl | FD_CLOEXEC);
+    }
+    if ((fl = ::fcntl(cv[0], F_GETFD)) >= 0) {
+        ::fcntl(cv[0], F_SETFD, fl | FD_CLOEXEC);
+    }
+    *out_data = dv[0];
+    *out_ctrl = cv[0];
+    return pid;
+}
+
+// caller holds g_wk_mtx
+static void kill_worker_locked() {
+    if (g_wk_pid > 0) {
+        ::kill(g_wk_pid, SIGKILL);
+        int ws = 0;
+        ::waitpid(g_wk_pid, &ws, 0);
+        fprintf(stderr, "[Server] worker pid=%d killed -> VRAM reclaimed (true-0)\n", (int) g_wk_pid);
+    }
+    if (g_wk_data >= 0) {
+        ::close(g_wk_data);
+    }
+    if (g_wk_ctrl >= 0) {
+        ::close(g_wk_ctrl);
+    }
+    g_wk_pid  = -1;
+    g_wk_data = -1;
+    g_wk_ctrl = -1;
+}
+
+// caller holds g_wk_mtx. Ensures a live, ready worker. Returns false on failure.
+static bool ensure_worker_locked() {
+    if (g_wk_pid > 0) {
+        return true;
+    }
+    int   d = -1, c = -1;
+    pid_t pid = worker_spawn(&d, &c);
+    if (pid < 0) {
+        fprintf(stderr, "[Server] failed to spawn worker\n");
+        return false;
+    }
+    FrameHeader          hdr{};
+    std::vector<uint8_t> pl;
+    if (!recv_frame(d, &hdr, &pl) || (Frame) hdr.type != Frame::HELLO) {
+        ::kill(pid, SIGKILL);
+        int ws = 0;
+        ::waitpid(pid, &ws, 0);
+        ::close(d);
+        ::close(c);
+        fprintf(stderr, "[Server] worker failed to start\n");
+        return false;
+    }
+    g_wk_pid  = pid;
+    g_wk_data = d;
+    g_wk_ctrl = c;
+    fprintf(stderr, "[Server] worker pid=%d spawned (isolation)\n", (int) pid);
+    return true;
+}
+
+// Marshal one job to the worker child and block for its RESULT. The blocking
+// recv runs WITHOUT g_wk_mtx so /unload (or the idle watchdog) can SIGKILL the
+// child mid-render; the kill makes this recv fail and the job is finalized.
+static void dispatch_remote(std::shared_ptr<Job> job, const std::string & payload) {
+    int   data_fd;
+    pid_t pid;
+    {
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        if (!ensure_worker_locked()) {
+            job->status.store(JobStatus::FAILED);
+            return;
+        }
+        data_fd = g_wk_data;
+        pid     = g_wk_pid;
+        g_wk_busy.store(true);
+        if (!send_frame(data_fd, Frame::RUN, 0, payload.data(), payload.size())) {
+            kill_worker_locked();
+            g_wk_busy.store(false);
+            worker_touch();
+            job->status.store(JobStatus::FAILED);
+            return;
+        }
+    }
+
+    FrameHeader          hdr{};
+    std::vector<uint8_t> resp;
+    bool                 got = recv_frame(data_fd, &hdr, &resp) && (Frame) hdr.type == Frame::RESULT;
+
+    {
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        g_wk_busy.store(false);
+        worker_touch();
+        if (!got) {
+            // worker died: crash, or SIGKILL by /unload / watchdog. Reset if still ours.
+            if (g_wk_pid == pid) {
+                kill_worker_locked();
+            }
+            job->status.store(job->cancel.load() ? JobStatus::CANCELLED : JobStatus::FAILED);
+            return;
+        }
+    }
+
+    Rd          rd{ resp.data(), resp.size() };
+    int32_t     st   = rd.i32();
+    std::string mime = rd.str();
+    std::string body = rd.str();
+    // result_body/result_mime before status (the Job memory-ordering contract).
+    job->result_body = std::move(body);
+    job->result_mime = std::move(mime);
+    job->status.store((JobStatus) st);
+}
+
+static void worker_forward_cancel() {
+    if (!g_isolation) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_wk_mtx);
+    if (g_wk_ctrl >= 0) {
+        send_frame(g_wk_ctrl, Frame::CANCEL, 0, nullptr, 0);
+    }
+}
+
+static void worker_unload() {
+    if (!g_isolation) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_wk_mtx);
+    kill_worker_locked();
+}
+
+// Idle watchdog: SIGKILL the child once it has been idle (no in-flight RUN) for
+// g_idle_unload_seconds, dropping VRAM to true-0 between renders.
+static void worker_watchdog_main() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (g_wk_busy.load()) {
+            continue;
+        }
+        long long thresh = (long long) g_idle_unload_seconds * 1000;
+        if (now_ms() - g_wk_last_activity.load() < thresh) {
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        if (g_wk_pid > 0 && !g_wk_busy.load() && now_ms() - g_wk_last_activity.load() >= thresh) {
+            kill_worker_locked();
+        }
+    }
+}
+
+#else  // _WIN32: no fork; isolation is unavailable, controls are no-ops.
+static void dispatch_remote(std::shared_ptr<Job>, const std::string &) {}
+static void worker_forward_cancel() {}
+static void worker_unload() {}
+static void worker_touch() {}
+static int  worker_run_loop() { return 0; }
+static void worker_watchdog_main() {}
+#endif  // _WIN32
+
+// ── run_* wrappers: marshal under isolation, else run in-process ─────────────
+static void run_lm(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch_size, int mode) {
+    if (!g_isolation) {
+        lm_worker(job, std::move(ace_req), lm_batch_size, mode);
+        return;
+    }
+    std::string p;
+    pk_u32(p, JOB_LM);
+    pk_str(p, request_to_json(&ace_req, false));
+    pk_i32(p, lm_batch_size);
+    pk_i32(p, mode);
+    dispatch_remote(job, p);
+}
+
+static void run_synth(std::shared_ptr<Job>    job,
+                      std::vector<AceRequest> ace_reqs,
+                      float *                 src_interleaved,
+                      int                     src_len,
+                      std::vector<float>      src_latents,
+                      int                     src_T_latent,
+                      float *                 ref_interleaved,
+                      int                     ref_len,
+                      std::vector<float>      ref_latents,
+                      int                     ref_T_latent,
+                      bool                    output_wav,
+                      WavFormat               wav_fmt,
+                      int                     peak_clip) {
+    if (!g_isolation) {
+        synth_worker(job, std::move(ace_reqs), src_interleaved, src_len, std::move(src_latents), src_T_latent,
+                     ref_interleaved, ref_len, std::move(ref_latents), ref_T_latent, output_wav, wav_fmt, peak_clip);
+        return;
+    }
+    std::string p;
+    pk_u32(p, JOB_SYNTH);
+    pk_u32(p, (uint32_t) ace_reqs.size());
+    for (auto & r : ace_reqs) {
+        pk_str(p, request_to_json(&r, false));
+    }
+    pk_floats(p, src_interleaved, src_interleaved ? (size_t) src_len * 2 : 0);
+    pk_i32(p, src_len);
+    pk_floats(p, src_latents.data(), src_latents.size());
+    pk_i32(p, src_T_latent);
+    pk_floats(p, ref_interleaved, ref_interleaved ? (size_t) ref_len * 2 : 0);
+    pk_i32(p, ref_len);
+    pk_floats(p, ref_latents.data(), ref_latents.size());
+    pk_i32(p, ref_T_latent);
+    pk_u8(p, output_wav ? 1 : 0);
+    pk_i32(p, (int32_t) wav_fmt);
+    pk_i32(p, peak_clip);
+    // The parent owned these raw buffers (the in-process synth_worker would free
+    // them); the child marshals its own copies, so free them here.
+    free(src_interleaved);
+    free(ref_interleaved);
+    dispatch_remote(job, p);
+}
+
+static void run_understand(std::shared_ptr<Job> job,
+                           AceRequest           ace_req,
+                           float *              src_interleaved,
+                           int                  src_len,
+                           std::vector<float>   src_latents,
+                           int                  src_T_latent) {
+    if (!g_isolation) {
+        understand_worker(job, std::move(ace_req), src_interleaved, src_len, std::move(src_latents), src_T_latent);
+        return;
+    }
+    std::string p;
+    pk_u32(p, JOB_UND);
+    pk_str(p, request_to_json(&ace_req, false));
+    pk_floats(p, src_interleaved, src_interleaved ? (size_t) src_len * 2 : 0);
+    pk_i32(p, src_len);
+    pk_floats(p, src_latents.data(), src_latents.size());
+    pk_i32(p, src_T_latent);
+    free(src_interleaved);
+    dispatch_remote(job, p);
+}
+
+static void run_encode(std::shared_ptr<Job> job, AceRequest ace_req, float * src_interleaved, int src_len) {
+    if (!g_isolation) {
+        encode_worker(job, std::move(ace_req), src_interleaved, src_len);
+        return;
+    }
+    std::string p;
+    pk_u32(p, JOB_ENC);
+    pk_str(p, request_to_json(&ace_req, false));
+    pk_floats(p, src_interleaved, src_interleaved ? (size_t) src_len * 2 : 0);
+    pk_i32(p, src_len);
+    free(src_interleaved);
+    dispatch_remote(job, p);
+}
+
+static void run_decode(std::shared_ptr<Job> job,
+                       AceRequest           ace_req,
+                       std::vector<float>   src_latents,
+                       int                  src_T_latent,
+                       bool                 output_wav,
+                       WavFormat            wav_fmt,
+                       int                  peak_clip) {
+    if (!g_isolation) {
+        decode_worker(job, std::move(ace_req), std::move(src_latents), src_T_latent, output_wav, wav_fmt, peak_clip);
+        return;
+    }
+    std::string p;
+    pk_u32(p, JOB_DEC);
+    pk_str(p, request_to_json(&ace_req, false));
+    pk_floats(p, src_latents.data(), src_latents.size());
+    pk_i32(p, src_T_latent);
+    pk_u8(p, output_wav ? 1 : 0);
+    pk_i32(p, (int32_t) wav_fmt);
+    pk_i32(p, peak_clip);
+    dispatch_remote(job, p);
+}
+
 static void usage(const char * prog) {
     AceLmParams    lm_d;
     AceSynthParams synth_d;
@@ -1650,6 +2387,26 @@ int main(int argc, char ** argv) {
     ace_lm_default_params(&g_lm_params);
     ace_synth_default_params(&g_synth_params);
 
+    // Saved for fork+execv of self in --worker mode.
+    g_argc = argc;
+    g_argv = argv;
+
+    // Worker isolation: env-gated so it can be toggled without a rebuild. The
+    // forked child (--worker) ignores the flag; it always runs the GPU pipelines.
+#ifndef _WIN32
+    {
+        const char * iso = std::getenv("ACE_WORKER_ISOLATION");
+        g_isolation = iso && (!strcmp(iso, "1") || !strcmp(iso, "true") || !strcmp(iso, "yes") || !strcmp(iso, "on"));
+        const char * idle = std::getenv("ACE_IDLE_UNLOAD_SECONDS");
+        if (idle && *idle) {
+            g_idle_unload_seconds = atoi(idle);
+            if (g_idle_unload_seconds < 0) {
+                g_idle_unload_seconds = 0;
+            }
+        }
+    }
+#endif
+
     const char * host         = "127.0.0.1";
     int          port         = 8080;
     const char * models_dir   = nullptr;
@@ -1686,6 +2443,13 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--kv-budget") && i + 1 < argc) {
             g_kv_budget = atoi(argv[++i]);
 
+            // worker-isolation child fds (set by the parent's fork+execv)
+        } else if (!strcmp(argv[i], "--worker") && i + 1 < argc) {
+            g_worker_mode    = true;
+            g_worker_data_fd = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--control") && i + 1 < argc) {
+            g_worker_ctrl_fd = atoi(argv[++i]);
+
             // debug
         } else if (!strcmp(argv[i], "--no-fsm")) {
             g_lm_params.use_fsm = false;
@@ -1716,8 +2480,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
-    LogCapture log_capture;
+    // stderr capture for SSE /logs (must be after arg parsing so --help prints directly).
+    // The worker child skips it: it inherits the parent's stderr fd (the /logs pipe)
+    // so its logs already flow there; re-dup'ing would detach them.
+    std::unique_ptr<LogCapture> log_capture;
+    if (!g_worker_mode) {
+        log_capture = std::make_unique<LogCapture>();
+    }
 
     // scan models directory (reads GGUF metadata only)
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
@@ -1783,7 +2552,30 @@ int main(int argc, char ** argv) {
     // central store: one policy for the whole server lifetime. STRICT keeps
     // at most one GPU module resident at a time; --keep-loaded flips it to
     // NEVER and lets the working set accumulate across requests.
-    g_store = store_create(g_keep_loaded ? EVICT_NEVER : EVICT_STRICT);
+    //
+    // Worker isolation: the GPU-owning store lives ONLY in the worker child. The
+    // parent (HTTP front-end) holds no store and no CUDA context. Without
+    // isolation, the in-process server creates the store as before.
+    if (g_worker_mode || !g_isolation) {
+        g_store = store_create(g_keep_loaded ? EVICT_NEVER : EVICT_STRICT);
+    }
+
+    // Worker child: serve marshalled jobs from the parent over IPC, then exit.
+    // No HTTP server, no job table — the parent owns those.
+    if (g_worker_mode) {
+        if (g_worker_data_fd < 0 || g_worker_ctrl_fd < 0) {
+            fprintf(stderr, "[worker] missing --worker/--control fds\n");
+            return 1;
+        }
+        return worker_run_loop();
+    }
+
+    if (g_isolation) {
+        fprintf(stderr, "[Server] worker isolation ENABLED (GPU runs in a forked child; "
+                        "idle-unload=%ds)\n",
+                g_idle_unload_seconds);
+        worker_touch();
+    }
 
     // setup HTTP server
     httplib::Server svr;
@@ -1808,6 +2600,13 @@ int main(int argc, char ** argv) {
     // reject oversized bodies (256 MB: src + ref audio, up to 10min WAV each)
     svr.set_payload_max_length(256 * 1024 * 1024);
 
+    // Mark activity on every request so the idle watchdog keeps the worker warm
+    // across a render's lm -> synth -> vae sequence (no-op without isolation).
+    svr.set_pre_routing_handler([](const httplib::Request &, httplib::Response &) {
+        worker_touch();
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     // all endpoints are always registered. handlers return 501 when the
     // backing pipeline has no models in the registry.
     svr.Post("/lm", handle_lm);
@@ -1819,6 +2618,17 @@ int main(int argc, char ** argv) {
     });
     svr.Get("/props", handle_props);
     svr.Get("/logs", handle_logs);
+
+    // /unload (alias /v1/admin/unload): SIGKILL the worker child so VRAM (incl.
+    // the CUDA context) returns to true-0. Lets the GPU gate reclaim the card for
+    // TTS/STT mid-idle; the next job re-spawns the child (cold CUDA init). Without
+    // isolation there is nothing to unload (returns unloaded=false).
+    auto do_unload = [](const httplib::Request &, httplib::Response & res) {
+        worker_unload();
+        res.set_content(g_isolation ? "{\"unloaded\":true}" : "{\"unloaded\":false}", "application/json");
+    };
+    svr.Post("/unload", do_unload);
+    svr.Post("/v1/admin/unload", do_unload);
 
     // job system endpoints
     svr.Get("/job", [](const httplib::Request & req, httplib::Response & res) {
@@ -1861,6 +2671,7 @@ int main(int argc, char ** argv) {
             JobStatus status = job->status.load();
             if (status == JobStatus::RUNNING) {
                 job->cancel.store(true);
+                worker_forward_cancel();  // under isolation, reach the child mid-render
                 fprintf(stderr, "[Server] Cancel requested for job %s\n", job->id.c_str());
                 status = JobStatus::CANCELLED;
             }
@@ -1895,6 +2706,12 @@ int main(int argc, char ** argv) {
     // start FIFO worker thread (processes all GPU jobs in order)
     std::thread worker(worker_main);
 
+    // idle watchdog: under isolation, SIGKILL the GPU child after it goes idle so
+    // VRAM drops to true-0 between renders.
+    if (g_isolation && g_idle_unload_seconds >= 0) {
+        std::thread(worker_watchdog_main).detach();
+    }
+
     fprintf(stderr, "[Server] acestep.cpp %s\n", ACE_VERSION);
     fprintf(stderr, "[Server] Listening on %s:%d\n", host, port);
     fprintf(stderr, "[Server] Pipelines:%s%s%s\n", have_lm ? " /lm" : "", have_synth ? " /synth" : "",
@@ -1915,7 +2732,10 @@ int main(int argc, char ** argv) {
 
     // cleanup
     fprintf(stderr, "[Server] Shutting down...\n");
-    store_free(g_store);
+    worker_unload();  // SIGKILL the GPU child (no-op without isolation)
+    if (g_store) {
+        store_free(g_store);
+    }
     fprintf(stderr, "[Server] Done\n");
 
     return 0;
