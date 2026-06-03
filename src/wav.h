@@ -4,6 +4,7 @@
 //               mono or stereo, any rate -> interleaved [T, 2] float
 
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -180,4 +181,102 @@ static float * read_wav_buf(const uint8_t * data, size_t size, int * T_audio, in
     fprintf(stderr, "[WAV] Read buffer: %d samples, %d Hz, %d ch, %d bit\n", n_samples, sample_rate, n_channels,
             bits_per_sample);
     return audio;
+}
+
+static void wav_put_u16le(FILE * f, uint16_t x) {
+    unsigned char b[2] = { (unsigned char) (x & 0xff), (unsigned char) ((x >> 8) & 0xff) };
+    fwrite(b, 1, 2, f);
+}
+
+static void wav_put_u32le(FILE * f, uint32_t x) {
+    unsigned char b[4] = { (unsigned char) (x & 0xff), (unsigned char) ((x >> 8) & 0xff),
+                           (unsigned char) ((x >> 16) & 0xff), (unsigned char) ((x >> 24) & 0xff) };
+    fwrite(b, 1, 4, f);
+}
+
+// Write planar stereo float [L: T][R: T] to a 16-bit PCM WAV. NaN/Inf -> 0.
+// peak_target>0: gentle LOOKAHEAD LIMITER (linked stereo, downward-only) — smooth ~1.5ms
+// attack ramp + ~83ms release that ducks only around the brief peaks of the inherently-hot
+// Oobleck VAE output (peaks ~1.4), preserving body loudness instead of pulling the whole clip
+// down. Avoids the int16-rail flat-top clipping. peak_target<=0 disables (plain [-1,1] clamp,
+// matching the reference's silent FLAC clip).
+static bool write_wav_s16_planar(const char * path, const float * audio, int T_audio, int sr,
+                                 float peak_target = 0.985f) {
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[WAV] cannot open %s for writing\n", path);
+        return false;
+    }
+    // Lookahead limiter (linked stereo, downward-only): forward window-MIN over [i,i+look]
+    // gives the anticipation (gain is already reduced before any peak in the next `look`
+    // samples, catching even single-sample impulses), then a slow release one-pole lets gain
+    // recover smoothly after the peak passes. Applied directly (the window-min IS the lookahead).
+    std::vector<float> glim;
+    if (peak_target > 0.0f && T_audio > 0) {
+        const float * Lc   = audio;
+        const float * Rc   = audio + T_audio;
+        int           look = sr / 666 > 1 ? sr / 666 : 1;  // ~1.5ms anticipation
+        int           relS = sr / 12 > 1 ? sr / 12 : 1;    // ~83ms release
+        float         relC = expf(-1.0f / (float) relS);
+        // per-sample target gain from the linked-stereo peak
+        std::vector<float> tgt((size_t) T_audio);
+        for (int i = 0; i < T_audio; i++) {
+            float l  = std::isfinite(Lc[i]) ? (Lc[i] < 0 ? -Lc[i] : Lc[i]) : 0.0f;
+            float r  = std::isfinite(Rc[i]) ? (Rc[i] < 0 ? -Rc[i] : Rc[i]) : 0.0f;
+            float pk = l > r ? l : r;
+            tgt[i]   = pk > peak_target ? peak_target / pk : 1.0f;
+        }
+        // forward window-min (monotonic deque): glim[i] = min(tgt[i..i+look])
+        glim.assign((size_t) T_audio, 1.0f);
+        std::vector<int> dq((size_t) T_audio);
+        int              head = 0, tail = 0;  // dq[head..tail)
+        for (int i = T_audio - 1; i >= 0; i--) {
+            while (tail > head && tgt[dq[tail - 1]] >= tgt[i]) tail--;
+            dq[tail++] = i;
+            while (dq[head] > i + look) head++;
+            glim[i] = tgt[dq[head]];
+        }
+        // release: instant drop (anticipated), slow rise
+        float s = 1.0f, gmin = 1.0f;
+        for (int i = 0; i < T_audio; i++) {
+            s       = (glim[i] < s) ? glim[i] : relC * s + (1.0f - relC) * glim[i];
+            glim[i] = s;
+            if (s < gmin) gmin = s;
+        }
+        if (gmin < 0.999f) {
+            fprintf(stderr, "[WAV] lookahead-limit: min gain %.3f (ceil %.3f, %.1fms attack/%dms release)\n", gmin,
+                    peak_target, 1000.0f * (float) look / (float) sr, (int) (1000.0f * (float) relS / (float) sr));
+        }
+    }
+    const int      n_channels = 2;
+    const int      bits       = 16;
+    const uint32_t data_size  = (uint32_t) T_audio * n_channels * (bits / 8);
+
+    fwrite("RIFF", 1, 4, f);
+    wav_put_u32le(f, 36 + data_size);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    wav_put_u32le(f, 16);
+    wav_put_u16le(f, 1);                                       // PCM
+    wav_put_u16le(f, (uint16_t) n_channels);
+    wav_put_u32le(f, (uint32_t) sr);
+    wav_put_u32le(f, (uint32_t) (sr * n_channels * (bits / 8)));  // byte rate
+    wav_put_u16le(f, (uint16_t) (n_channels * (bits / 8)));    // block align
+    wav_put_u16le(f, (uint16_t) bits);
+    fwrite("data", 1, 4, f);
+    wav_put_u32le(f, data_size);
+
+    const float * L = audio;
+    const float * R = audio + T_audio;
+    for (int t = 0; t < T_audio; t++) {
+        float g  = glim.empty() ? 1.0f : glim[t];
+        float lf = std::isfinite(L[t]) ? L[t] * g : 0.0f;
+        float rf = std::isfinite(R[t]) ? R[t] * g : 0.0f;
+        lf       = lf < -1.0f ? -1.0f : (lf > 1.0f ? 1.0f : lf);  // safety net (limiter already fits)
+        rf       = rf < -1.0f ? -1.0f : (rf > 1.0f ? 1.0f : rf);
+        wav_put_u16le(f, (uint16_t) (int16_t) (lf * 32767.0f));
+        wav_put_u16le(f, (uint16_t) (int16_t) (rf * 32767.0f));
+    }
+    fclose(f);
+    return true;
 }

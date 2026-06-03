@@ -126,6 +126,71 @@ add_executable(ace-lm tools/ace-lm.cpp)
 target_link_libraries(ace-lm PRIVATE acestep-core)
 link_ggml_backends(ace-lm)
 
+# songgen-lelm-test: SongGeneration LeLM bring-up harness (npy I/O, no core deps)
+add_executable(songgen-lelm-test tools/songgen-lelm-test.cpp)
+link_ggml_backends(songgen-lelm-test)
+
+# songgen-lelm-gen-test: GATE-1 KV-cache decode vs full-prefill oracle (npy I/O, no core deps)
+add_executable(songgen-lelm-gen-test tools/songgen-lelm-gen-test.cpp)
+link_ggml_backends(songgen-lelm-gen-test)
+
+# songgen-vae-test: SongGeneration Stable-Audio Oobleck VAE decoder harness (npy I/O, no core deps)
+add_executable(songgen-vae-test tools/songgen-vae-test.cpp)
+link_ggml_backends(songgen-vae-test)
+
+# songgen-cfm-test: SongGeneration CFM reflow estimator (custom GPT2) harness (npy I/O, no core deps)
+add_executable(songgen-cfm-test tools/songgen-cfm-test.cpp)
+link_ggml_backends(songgen-cfm-test)
+
+# songgen-vae-enc-test: Oobleck VAE ENCODER harness (npy I/O, no core deps)
+add_executable(songgen-vae-enc-test tools/songgen-vae-enc-test.cpp)
+link_ggml_backends(songgen-vae-enc-test)
+
+# songgen-rvq-enc-test: descript RVQ ENCODE harness (npy I/O, no core deps)
+add_executable(songgen-rvq-enc-test tools/songgen-rvq-enc-test.cpp)
+link_ggml_backends(songgen-rvq-enc-test)
+
+# songgen-musicfm-test: MusicFM_95M BESTRQ encoder harness (npy I/O, no core deps)
+add_executable(songgen-musicfm-test tools/songgen-musicfm-test.cpp)
+link_ggml_backends(songgen-musicfm-test)
+
+# songgen-htdemucs-test: HTDemucs source separator block-by-block golden harness (npy I/O)
+add_executable(songgen-htdemucs-test tools/songgen-htdemucs-test.cpp)
+link_ggml_backends(songgen-htdemucs-test)
+
+# songgen-separate: HTDemucs mix.wav -> vocal_48k.wav + bgm_48k.wav
+add_executable(songgen-separate tools/songgen-separate.cpp)
+link_ggml_backends(songgen-separate)
+
+# songgen-decode: SongGeneration audio decode driver (codes -> CFM ODE -> VAE -> wav)
+# header-only: songgen-cfm.h + songgen-vae.h + songgen-septoken.h + npy.h + wav.h
+add_executable(songgen-decode tools/songgen-decode.cpp)
+link_ggml_backends(songgen-decode)
+
+# songgen-decode-chunk-test: validate chunked CFM+VAE decode continuity (seam stats)
+add_executable(songgen-decode-chunk-test tools/songgen-decode-chunk-test.cpp)
+link_ggml_backends(songgen-decode-chunk-test)
+
+# songgen-tok-test: GATE for in-C++ Qwen2 conditioning tokenizer vs golden npy
+add_executable(songgen-tok-test tools/songgen-tok-test.cpp)
+link_ggml_backends(songgen-tok-test)
+
+# songgen-generate: GATE-2 full pipeline (LeLM KV-cache generation -> CFM/VAE decode -> wav)
+add_executable(songgen-generate tools/songgen-generate.cpp)
+link_ggml_backends(songgen-generate)
+
+# songgen-clone-encode-test: audio-prompt clone encode (stems -> 3 token streams) vs goldens
+add_executable(songgen-clone-encode-test tools/songgen-clone-encode-test.cpp)
+link_ggml_backends(songgen-clone-encode-test)
+
+# songgen-clone: full clone pipeline (stems -> prompt tokens -> LeLM -> CFM/VAE decode -> wav)
+add_executable(songgen-clone tools/songgen-clone.cpp)
+link_ggml_backends(songgen-clone)
+
+# songgen-continue: audio-prompt CONTINUATION (prompt seeds CFM in-context + LM, prompt trimmed out)
+add_executable(songgen-continue tools/songgen-continue.cpp)
+link_ggml_backends(songgen-continue)
+
 # webui: convert tools/webui/public/index.html.gz to a C header for embedding.
 # the .gz is committed to git so the C++ build works without npm.
 # to update: cd tools/webui && npm install && npm run build, then rebuild ace-server.
@@ -144,6 +209,14 @@ add_executable(ace-server tools/ace-server.cpp ${WEBUI_OUTPUT})
 target_include_directories(ace-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(ace-server PRIVATE acestep-core httplib)
 link_ggml_backends(ace-server)
+
+# songgen-server: HTTP API for the SongGeneration port.
+# v0 wraps the songgen-* CLIs via subprocess-exec (true process isolation:
+# model memory freed on child exit). No GPU/ggml linkage — it just shells out.
+add_executable(songgen-server tools/songgen-server.cpp)
+target_include_directories(songgen-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(songgen-server PRIVATE httplib yyjson Threads::Threads)
+add_dependencies(songgen-server version)
 
 add_executable(ace-understand tools/ace-understand.cpp)
 target_link_libraries(ace-understand PRIVATE acestep-core)
