@@ -1166,6 +1166,17 @@ static void htd_forward(SonggenHTDemucs * m, const float * mix, int N, int AC, H
             }
         }
 
+    if (getenv("HTD_DEBUG_RMS")) {
+        // RMS of each branch's contribution in stem 3 (vocal), pre-sum, to see which blows up.
+        double spec_sq = 0, tot_sq = 0; int a0 = 0; size_t cnt = training_length;
+        for (int t = 0; t < training_length; t++) {
+            double tot = out->stems[((size_t) 3 * AC + a0) * training_length + t];
+            tot_sq += tot * tot;
+        }
+        for (int t = 0; t < (int) cnt; t++) (void) spec_sq;
+        fprintf(stderr, "[HTD_NORM] smean=%.5f sstd=%.5f tmean=%.5f tstd=%.5f | stem3ch0 rms=%.4f\n",
+                smean, sstd, tmean, tstd, sqrt(tot_sq / (double) cnt));
+    }
     fprintf(stderr, "[HTDEMUCS] forward graph %d nodes\n", ggml_graph_n_nodes(g));
     ggml_backend_sched_reset(m->sched);
     ggml_free(c);

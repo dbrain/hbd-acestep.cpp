@@ -84,6 +84,15 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < len; i++) sgm[(size_t) c * seg + i] = mix44[(size_t) c * N44 + off + i];
         HtdForwardOut fo;
         htd_forward(&m, sgm.data(), seg, AC, &fo);
+        if (getenv("HTD_DEBUG_RMS")) {
+            for (int s = 0; s < S; s++) {
+                double sq = 0; size_t cnt = (size_t) AC * len;
+                for (int c = 0; c < AC; c++) for (int i = 0; i < len; i++) {
+                    double v = fo.stems[((size_t) s * AC + c) * seg + i]; sq += v * v;
+                }
+                fprintf(stderr, "[HTD_DEBUG_RMS] seg %d stem %d rms=%.4f\n", n_segs, s, sqrt(sq / (double) cnt));
+            }
+        }
         for (int s = 0; s < S; s++)
             for (int c = 0; c < AC; c++)
                 for (int i = 0; i < len; i++)
@@ -124,8 +133,12 @@ int main(int argc, char ** argv) {
     std::vector<float> voc48 = resample_kaiser(vocal, AC, N44, m.sample_rate, 48000, &N48);
     std::vector<float> bgm48 = resample_kaiser(bgm, AC, N44, m.sample_rate, 48000, &N48);
 
-    write_wav_s16_planar(vocp.c_str(), voc48.data(), N48, 48000, 0.0f);
-    write_wav_s16_planar(bgmp.c_str(), bgm48.data(), N48, 48000, 0.0f);
+    // HTDemucs forward output is content-faithful (cossim >0.99 vs golden) but globally over-scaled
+    // (~60x; the block goldens are cosine-validated == scale-invariant, so it slipped through). Each
+    // stem is independently peak-normalized to 0.985 here so downstream (clone/continue encoders) get
+    // clean, unclipped, correctly-levelled audio. (Root-cause of the forward over-scale = follow-up.)
+    write_wav_s16_planar(vocp.c_str(), voc48.data(), N48, 48000, 0.985f);
+    write_wav_s16_planar(bgmp.c_str(), bgm48.data(), N48, 48000, 0.985f);
     fprintf(stderr, "[separate] wrote %s + %s (48k, %d samples)\n", vocp.c_str(), bgmp.c_str(), N48);
 
     htd_free(&m);
