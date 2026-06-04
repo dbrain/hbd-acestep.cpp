@@ -141,7 +141,7 @@ static void stub_501(httplib::Response & res, const char * endpoint, const char 
 // subprocess exec: run argv, inherit stderr (logs), wait. Returns exit code or
 // -1 on spawn failure. No shell — argv is passed straight to execv.
 // ───────────────────────────────────────────────────────────────────────────
-static int run_subprocess(const std::vector<std::string> & args) {
+static int run_subprocess(const std::vector<std::string> & args, const char * force_backend = nullptr) {
     std::vector<char *> argv;
     argv.reserve(args.size() + 1);
     for (const auto & a : args) {
@@ -155,6 +155,11 @@ static int run_subprocess(const std::vector<std::string> & args) {
         return -1;
     }
     if (pid == 0) {
+        // Per-subprocess backend override: htdemucs separation is broken on CUDA (junk output)
+        // but correct on CPU, so /separate runs the child with GGML_BACKEND=CPU.
+        if (force_backend) {
+            setenv("GGML_BACKEND", force_backend, 1);
+        }
         execv(argv[0], argv.data());
         fprintf(stderr, "[songgen-server] execv %s failed: %s\n", argv[0], strerror(errno));
         _exit(127);
@@ -475,7 +480,7 @@ static void handle_separate(const httplib::Request & req, httplib::Response & re
     int rc;
     {
         std::lock_guard<std::mutex> lock(g_compute_mtx);
-        rc = run_subprocess(args);
+        rc = run_subprocess(args, /*force_backend=*/"CPU");  // htdemucs CUDA = broken; CPU is correct
     }
     unlink(mix.c_str());
     if (rc != 0) {
