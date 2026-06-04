@@ -42,6 +42,19 @@ struct SonggenLeLMGen {
     int                  sub_pos[2];
 };
 
+// KV cache element type. F16 default; SG_KV_TYPE=q8_0|q4_0 quantizes the cache (FA reads it
+// directly). D=head_dim must be a multiple of the quant block (32) — 128/32=4, ok. Quantized KV
+// halves (Q8_0) or quarters (Q4_0) the LM-stage KV footprint, the binding VRAM term at length.
+static enum ggml_type sggen_kv_type() {
+    const char * e = getenv("SG_KV_TYPE");
+    if (e) {
+        if (!strcmp(e, "q8_0")) return GGML_TYPE_Q8_0;
+        if (!strcmp(e, "q4_0")) return GGML_TYPE_Q4_0;
+        if (!strcmp(e, "f16"))  return GGML_TYPE_F16;
+    }
+    return GGML_TYPE_F16;
+}
+
 static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int n_sets) {
     *g            = {};
     g->m          = m;
@@ -53,6 +66,7 @@ static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int
     int Lm = c.n_layers;
     int Ls = c.n_layers_sub;
     int S  = max_seq;
+    enum ggml_type kvt = sggen_kv_type();
 
     // (Lm+Ls)*2 4D tensors + (Lm+Ls)*2*n_sets 3D views (views still consume ctx object space).
     int                     n_tensors = (Lm + Ls) * 2 * (1 + n_sets);
@@ -63,8 +77,8 @@ static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int
     auto mk4 = [&](struct ggml_tensor *(&k4)[SGLM_MAX_LAYERS], struct ggml_tensor *(&v4)[SGLM_MAX_LAYERS],
                    struct ggml_tensor *(&k3)[2][SGLM_MAX_LAYERS], struct ggml_tensor *(&v3)[2][SGLM_MAX_LAYERS], int L) {
         for (int l = 0; l < L; l++) {
-            k4[l] = ggml_new_tensor_4d(g->kv_ctx, GGML_TYPE_F16, D, S, Nh, n_sets);
-            v4[l] = ggml_new_tensor_4d(g->kv_ctx, GGML_TYPE_F16, D, S, Nh, n_sets);
+            k4[l] = ggml_new_tensor_4d(g->kv_ctx, kvt, D, S, Nh, n_sets);
+            v4[l] = ggml_new_tensor_4d(g->kv_ctx, kvt, D, S, Nh, n_sets);
             for (int s = 0; s < n_sets; s++) {
                 size_t off = (size_t) s * k4[l]->nb[3];
                 k3[s][l]   = ggml_view_3d(g->kv_ctx, k4[l], D, S, Nh, k4[l]->nb[1], k4[l]->nb[2], off);
@@ -87,9 +101,10 @@ static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int
     }
     ggml_backend_buffer_clear(g->kv_buf, 0);
 
-    size_t kv_bytes = (size_t) n_sets * (Lm + Ls) * 2 * D * S * Nh * ggml_type_size(GGML_TYPE_F16);
-    fprintf(stderr, "[LeLM-gen] KV: %d sets, main %dL + sub %dL, S=%d -> %.1f MB\n", n_sets, Lm, Ls, S,
-            (float) kv_bytes / (1024 * 1024));
+    size_t kv_bytes = (size_t) n_sets * (Lm + Ls) * 2 * ((size_t) D * S * Nh / ggml_blck_size(kvt)) *
+                      ggml_type_size(kvt);
+    fprintf(stderr, "[LeLM-gen] KV: %d sets, main %dL + sub %dL, S=%d, type=%s -> %.1f MB\n", n_sets, Lm, Ls, S,
+            ggml_type_name(kvt), (float) kv_bytes / (1024 * 1024));
 }
 
 static void sggen_free_kv(SonggenLeLMGen * g) {
@@ -133,22 +148,34 @@ static struct ggml_tensor * sggen_attn(struct ggml_context * ctx,
     k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
-    // write K,V into cache at kv_pos
-    size_t nb1 = (size_t) D * ggml_type_size(GGML_TYPE_F16);
-    size_t nb2 = (size_t) D * max_seq * ggml_type_size(GGML_TYPE_F16);
+    // write K,V into cache at kv_pos. Use the cache tensor's OWN strides (nb[1]=seq, nb[2]=head)
+    // — these are correct for whatever element type the cache was allocated with (F16 or Q8_0).
+    // (Previously hardcoded F16 strides, which silently corrupted the prefix KV when the cache is
+    // quantized: writes landed at F16 offsets but the batched decoder reads at Q8_0 offsets.)
+    size_t nb1 = cache_k->nb[1];
+    size_t nb2 = cache_k->nb[2];
     size_t off = (size_t) kv_pos * nb1;
     struct ggml_tensor * k_dst = ggml_view_3d(ctx, cache_k, D, S, Nh, nb1, nb2, off);
-    struct ggml_tensor * v_dst = ggml_view_3d(ctx, cache_v, D, S, Nh, nb1, nb2, off);
+    struct ggml_tensor * v_dst = ggml_view_3d(ctx, cache_v, D, S, Nh, cache_v->nb[1], cache_v->nb[2],
+                                              (size_t) kv_pos * cache_v->nb[1]);
     ggml_build_forward_expand(gf, ggml_cpy(ctx, k, k_dst));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, v, v_dst));
 
     // read full KV [0..kv_len]
     struct ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, kv_len, Nh, nb1, nb2, 0);
-    struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, kv_len, Nh, nb1, nb2, 0);
+    struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, kv_len, Nh, cache_v->nb[1], cache_v->nb[2], 0);
 
     float                scale = 1.0f / sqrtf((float) D);
-    struct ggml_tensor * attn  = qwen3_attn_f32(ctx, ggml_cont(ctx, q), k_full, v_full, mask, scale);
-    attn                       = ggml_reshape_2d(ctx, attn, Nh * D, S);
+    static const bool    no_fa = getenv("SGLM_NO_FA") != NULL;
+    struct ggml_tensor * attn;
+    if (!no_fa) {
+        // FA over the F16 KV-cache views; q [D,S,Nh,1], k/v [D,kv_len,Nh,1], mask [kv_len,S].
+        attn = ggml_flash_attn_ext(ctx, ggml_cont(ctx, q), k_full, v_full, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    } else {
+        attn = qwen3_attn_f32(ctx, ggml_cont(ctx, q), k_full, v_full, mask, scale);
+    }
+    attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
     return qwen3_linear(ctx, ly->o_proj, attn);
 }
 
@@ -441,8 +468,19 @@ static struct ggml_tensor * sggen_attn_batch(struct ggml_context * ctx,
                                                 cache_v4->nb[3], 0);
 
     float                scale = 1.0f / sqrtf((float) D);
-    struct ggml_tensor * attn  = qwen3_attn_f32(ctx, q4, k_batch, v_batch, mask, scale);  // [D, Nh, 1, N]
-    attn                       = ggml_reshape_3d(ctx, attn, Nh * D, 1, N);
+    // Flash attention (default): one fused kernel over the strided KV-cache views instead of the
+    // ~6-kernel manual QKᵀ/softmax/transpose/×V chain — fewer launches (decode is latency-bound) and
+    // it consumes K/V directly in cache layout (un-transposed V == what FA wants), which also lets the
+    // cache be quantized. Validated against the prefill oracle by lelm-gen-test. SGLM_NO_FA reverts.
+    static const bool no_fa = getenv("SGLM_NO_FA") != NULL;
+    struct ggml_tensor * attn;
+    if (!no_fa) {
+        attn = ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, mask, scale, 0.0f, 0.0f);  // [D, Nh, 1, N]
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    } else {
+        attn = qwen3_attn_f32(ctx, q4, k_batch, v_batch, mask, scale);  // [D, Nh, 1, N]
+    }
+    attn = ggml_reshape_3d(ctx, attn, Nh * D, 1, N);
     return qwen3_linear(ctx, ly->o_proj, attn);
 }
 

@@ -110,14 +110,22 @@ static int sgpost_decode(SonggenSeptoken * sep, SonggenCfm * cfm, SonggenVae * v
 
     const int up = 1920;  // VAE upsample (48k, 25fps frames)
 
-    if (T <= p.chunk_frames) {
+    // SG_CHUNK_FRAMES env overrides chunk_frames (decode-stage VRAM knob: smaller = lower peak,
+    // more crossfaded segments). 0/unset -> the SgGenParams default.
+    int chunk_frames = p.chunk_frames;
+    if (const char * e = getenv("SG_CHUNK_FRAMES")) {
+        int v = atoi(e);
+        if (v > 0) chunk_frames = v;
+    }
+
+    if (T <= chunk_frames) {
         std::vector<float> latent;
         sgsep_decode(sep, cfm, codes_vocal, codes_bgm, (int) seed, latent);
         int T_audio = sgvae_decode(vae, latent.data(), T, wav_out);
         return T_audio;
     }
 
-    int min_f = p.chunk_frames;
+    int min_f = chunk_frames;
     int hop_f = min_f / 4 * 3;
     int ovlp_f = min_f - hop_f;
     int target_audio = T * up;
@@ -250,6 +258,10 @@ static int sgpost_decode_continue(SonggenSeptoken * sep, SonggenCfm * cfm, Songg
             Tpc, Tlat, n_gen, total_codes, target_audio);
 
     int min_f  = p.chunk_frames;
+    if (const char * e = getenv("SG_CHUNK_FRAMES")) {
+        int v = atoi(e);
+        if (v > 0) min_f = v;
+    }
     int hop_f  = min_f / 4 * 3;
     int ovlp_f = min_f - hop_f;
 

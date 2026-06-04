@@ -308,37 +308,204 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Stubbed endpoints (501 + planned schema). The wrapped CLIs already exist;
-// the open question is audio upload + async delivery (see out/API-DESIGN.md).
+// clone / continue / separate — IMPLEMENTED via multipart/form-data upload.
+//
+// Audio inputs arrive as multipart file parts; text params as multipart fields
+// (or, for backward-friendliness, none required beyond the files + lyric). The
+// wrapped CLI runs under the same global compute lock as /generate. Temp wavs
+// live in g_cfg.tmpdir and are unlinked after the response is built.
 // ───────────────────────────────────────────────────────────────────────────
-static void handle_clone(const httplib::Request &, httplib::Response & res) {
-    // wraps songgen-clone: separate-then-clone from stems (or a single mix via
-    // scripts/songgen-clone-native.sh). Needs vocal+bgm stems (or a full mix to
-    // run native separation first) -> open decision: upload transport.
-    stub_501(res, "/clone",
-             "{ lyric: string (required), description?: string, "
-             "vocal_stem: audio (required), bgm_stem: audio (required), "
-             "full_mix?: audio, duration?: number, seed?: number, "
-             "gen_type?: mixed|vocal|bgm, temp?, top_k?, cfg?, fade?, model?: q8|q4 } "
-             "-> audio/wav  [transport for audio inputs is the open question]");
+
+// base64 encoder (for /separate JSON response carrying two wavs).
+static std::string b64_encode(const std::string & in) {
+    static const char * T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string         out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        unsigned n = (unsigned char) in[i] << 16 | (unsigned char) in[i + 1] << 8 | (unsigned char) in[i + 2];
+        out += T[(n >> 18) & 63]; out += T[(n >> 12) & 63]; out += T[(n >> 6) & 63]; out += T[n & 63];
+    }
+    if (i < in.size()) {
+        unsigned n = (unsigned char) in[i] << 16;
+        if (i + 1 < in.size()) n |= (unsigned char) in[i + 1] << 8;
+        out += T[(n >> 18) & 63];
+        out += T[(n >> 12) & 63];
+        out += (i + 1 < in.size()) ? T[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
 }
 
-static void handle_continue(const httplib::Request &, httplib::Response & res) {
-    // wraps songgen-continue: extends a prompt song in-context.
-    stub_501(res, "/continue",
-             "{ lyric: string (required), description?: string, "
-             "vocal_stem: audio (required), bgm_stem: audio (required), "
-             "full_mix?: audio, duration?: number, seed?: number, "
-             "gen_type?: mixed|vocal|bgm, temp?, top_k?, cfg?, fade?, model?: q8|q4 } "
-             "-> audio/wav  [transport for audio inputs is the open question]");
+// Write a multipart file part's content to a unique temp .wav. Returns "" if absent.
+static std::string save_upload(const httplib::Request & req, const char * field) {
+    if (!req.form.has_file(field)) {
+        return "";
+    }
+    const auto   f    = req.form.get_file(field);
+    std::string  path = unique_out_path();  // .../songgen-<pid>-<n>.wav
+    FILE *       fp   = fopen(path.c_str(), "wb");
+    if (!fp) {
+        return "";
+    }
+    fwrite(f.content.data(), 1, f.content.size(), fp);
+    fclose(fp);
+    return path;
 }
 
-static void handle_separate(const httplib::Request &, httplib::Response & res) {
-    // wraps songgen-separate (htdemucs): mix -> {vocal, bgm}.
-    stub_501(res, "/separate",
-             "{ mix: audio (required) } "
-             "-> { vocal: audio/wav, bgm: audio/wav }  "
-             "[transport for audio in/out is the open question — multipart or URLs]");
+// multipart field value (text), else default.
+static std::string form_str(const httplib::Request & req, const char * key, const char * dflt) {
+    if (req.form.has_field(key)) {  // multipart text field
+        return req.form.get_field(key);
+    }
+    if (req.form.has_file(key)) {   // file part used as a value
+        return req.form.get_file(key).content;
+    }
+    if (req.has_param(key)) {       // urlencoded / query param
+        return req.get_param_value(key);
+    }
+    return dflt;
+}
+static bool form_has(const httplib::Request & req, const char * key) {
+    return req.form.has_field(key) || req.form.has_file(key) || req.has_param(key);
+}
+
+// Shared driver for clone/continue: assemble argv, run, return wav.
+static void run_stem_job(const httplib::Request & req, httplib::Response & res, bool is_continue) {
+    std::string lyric = form_str(req, "lyric", "");
+    if (lyric.empty()) {
+        json_error(res, 400, "'lyric' is required");
+        return;
+    }
+    std::string vocal = save_upload(req, "vocal_stem");
+    std::string bgm   = save_upload(req, "bgm_stem");
+    std::string mix   = save_upload(req, "full_mix");  // optional
+    if (vocal.empty() || bgm.empty()) {
+        if (!vocal.empty()) unlink(vocal.c_str());
+        if (!bgm.empty())   unlink(bgm.c_str());
+        if (!mix.empty())   unlink(mix.c_str());
+        json_error(res, 400, "both 'vocal_stem' and 'bgm_stem' audio files are required");
+        return;
+    }
+
+    std::string model    = form_str(req, "model", "q8");
+    std::string gen_type = form_str(req, "gen_type", "mixed");
+    double      duration = atof(form_str(req, "duration", "15").c_str());
+    double      seed     = atof(form_str(req, "seed", "1234").c_str());
+    if (model != "q8" && model != "q4") model = "q8";
+    if (duration <= 0.0 || duration > (double) g_cfg.max_duration) duration = 15.0;
+
+    std::string out_wav = unique_out_path();
+    const char * exe    = is_continue ? "/songgen-continue" : "/songgen-clone";
+
+    // both CLIs: <lelm> <cfm> <vae> [<vae-encoder> (continue only)] <septoken-aux>
+    //            <1rvq-aux> <musicfm-sep> <musicfm-1rvq> <out.wav> [seed] --vocal-stem ...
+    std::vector<std::string> args = { g_cfg.bindir + exe, lelm_path(model), gguf_path("songgen-cfm.gguf"),
+                                      gguf_path("songgen-vae.gguf") };
+    if (is_continue) {
+        args.push_back(gguf_path("songgen-vae-encoder.gguf"));
+    }
+    args.push_back(gguf_path("songgen-septoken-aux.gguf"));
+    args.push_back(gguf_path("songgen-1rvq-aux.gguf"));
+    args.push_back(gguf_path("songgen-musicfm.gguf"));
+    args.push_back(gguf_path("songgen-musicfm-1rvq.gguf"));
+    args.push_back(out_wav);
+    args.push_back(std::to_string((unsigned long long) seed));
+    args.push_back("--vocal-stem"); args.push_back(vocal);
+    args.push_back("--bgm-stem");   args.push_back(bgm);
+    if (!mix.empty()) { args.push_back("--full-mix"); args.push_back(mix); }
+    args.push_back("--lyric");      args.push_back(lyric);
+    if (form_has(req, "description")) { args.push_back("--description"); args.push_back(form_str(req, "description", "")); }
+    args.push_back("--duration");   args.push_back(std::to_string(duration));
+    args.push_back("--gen-type");   args.push_back(gen_type);
+    if (form_has(req, "temp"))  { args.push_back("--temp");  args.push_back(form_str(req, "temp", "1.0")); }
+    if (form_has(req, "top_k")) { args.push_back("--top-k"); args.push_back(form_str(req, "top_k", "250")); }
+    if (form_has(req, "cfg"))   { args.push_back("--cfg");   args.push_back(form_str(req, "cfg", "1.5")); }
+    if (form_has(req, "fade"))  { args.push_back("--fade");  args.push_back(form_str(req, "fade", "200")); }
+
+    fprintf(stderr, "[songgen-server] /%s model=%s dur=%.1fs seed=%llu type=%s\n",
+            is_continue ? "continue" : "clone", model.c_str(), duration, (unsigned long long) seed, gen_type.c_str());
+
+    int rc;
+    {
+        std::lock_guard<std::mutex> lock(g_compute_mtx);
+        rc = run_subprocess(args);
+    }
+    unlink(vocal.c_str());
+    unlink(bgm.c_str());
+    if (!mix.empty()) unlink(mix.c_str());
+
+    if (rc != 0) {
+        unlink(out_wav.c_str());
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s failed (exit %d)", exe + 1, rc);
+        json_error(res, 500, msg);
+        return;
+    }
+    std::string wav;
+    if (!read_file(out_wav, wav)) {
+        unlink(out_wav.c_str());
+        json_error(res, 500, "no output produced");
+        return;
+    }
+    unlink(out_wav.c_str());
+    res.set_content(wav, "audio/wav");
+    fprintf(stderr, "[songgen-server] /%s done (%zu bytes)\n", is_continue ? "continue" : "clone", wav.size());
+}
+
+static void handle_clone(const httplib::Request & req, httplib::Response & res) {
+    run_stem_job(req, res, /*is_continue=*/false);
+}
+
+static void handle_continue(const httplib::Request & req, httplib::Response & res) {
+    run_stem_job(req, res, /*is_continue=*/true);
+}
+
+// /separate (htdemucs): multipart 'mix' -> JSON { vocal: <b64 wav>, bgm: <b64 wav> }.
+static void handle_separate(const httplib::Request & req, httplib::Response & res) {
+    std::string mix = save_upload(req, "mix");
+    if (mix.empty()) {
+        json_error(res, 400, "multipart 'mix' audio file is required");
+        return;
+    }
+    std::string vocal_out = unique_out_path();
+    std::string bgm_out   = unique_out_path();
+    std::vector<std::string> args = { g_cfg.bindir + "/songgen-separate", gguf_path("songgen-htdemucs.gguf"),
+                                      mix, vocal_out, bgm_out };
+    int rc;
+    {
+        std::lock_guard<std::mutex> lock(g_compute_mtx);
+        rc = run_subprocess(args);
+    }
+    unlink(mix.c_str());
+    if (rc != 0) {
+        unlink(vocal_out.c_str());
+        unlink(bgm_out.c_str());
+        char msg[128];
+        snprintf(msg, sizeof(msg), "separation failed (exit %d)", rc);
+        json_error(res, 500, msg);
+        return;
+    }
+    std::string vwav, bwav;
+    if (!read_file(vocal_out, vwav) || !read_file(bgm_out, bwav)) {
+        unlink(vocal_out.c_str());
+        unlink(bgm_out.c_str());
+        json_error(res, 500, "separation produced no output");
+        return;
+    }
+    unlink(vocal_out.c_str());
+    unlink(bgm_out.c_str());
+
+    yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val * root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "vocal", b64_encode(vwav).c_str());
+    yyjson_mut_obj_add_strcpy(doc, root, "bgm", b64_encode(bwav).c_str());
+    char * out = yyjson_mut_write(doc, 0, nullptr);
+    res.set_content(out ? out : "{}", "application/json");
+    free(out);
+    yyjson_mut_doc_free(doc);
+    fprintf(stderr, "[songgen-server] /separate done (vocal %zu + bgm %zu bytes)\n", vwav.size(), bwav.size());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
