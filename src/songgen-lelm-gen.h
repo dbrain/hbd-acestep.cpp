@@ -21,9 +21,14 @@
 
 #define SGGEN_MAX_SETS 4  // cond/uncond for main + cond/uncond for sub kept separate per stack
 
+// Upstream SongGeneration-v2-large generates to the model's max length and stops on EOS — there
+// is no duration target. config.yaml max_dur = 270 s @ 25 fps frame rate = 6750 code frames.
+#define SGGEN_MODEL_MAX_FRAMES 6750  // 270 s ceiling (EOS terminates earlier for most prompts)
+
 struct SonggenLeLMGen {
     SonggenLeLM * m;
-    int           max_seq;  // KV capacity (prepend 952 + max codes)
+    int           max_seq;  // current KV capacity (allocated)
+    int           cap_seq;  // hard ceiling: KV never grows past this (== max_seq for static alloc)
     int           n_sets;   // 2 (cond, uncond)
 
     struct ggml_context * kv_ctx;
@@ -55,18 +60,20 @@ static enum ggml_type sggen_kv_type() {
     return GGML_TYPE_F16;
 }
 
-static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int n_sets) {
-    *g            = {};
-    g->m          = m;
-    g->max_seq    = max_seq;
-    g->n_sets     = n_sets;
+static size_t sggen_kv_bytes(const SonggenConfig & c, int n_sets, int S, enum ggml_type kvt) {
+    return (size_t) n_sets * (c.n_layers + c.n_layers_sub) * 2 *
+           ((size_t) c.head_dim * S * c.n_heads / ggml_blck_size(kvt)) * ggml_type_size(kvt);
+}
+
+// (Re)build the KV tensors+views+buffer at capacity `S` into a fresh ctx. Leaves positions
+// untouched (so a grow preserves main_pos/sub_pos). Sets g->max_seq=S.
+static void sggen_build_kv_tensors(SonggenLeLMGen * g, int S) {
+    SonggenLeLM *         m = g->m;
     const SonggenConfig & c = m->cfg;
-    int D  = c.head_dim;
-    int Nh = c.n_heads;
-    int Lm = c.n_layers;
-    int Ls = c.n_layers_sub;
-    int S  = max_seq;
+    int D = c.head_dim, Nh = c.n_heads, Lm = c.n_layers, Ls = c.n_layers_sub;
+    int n_sets = g->n_sets;
     enum ggml_type kvt = sggen_kv_type();
+    g->max_seq = S;
 
     // (Lm+Ls)*2 4D tensors + (Lm+Ls)*2*n_sets 3D views (views still consume ctx object space).
     int                     n_tensors = (Lm + Ls) * 2 * (1 + n_sets);
@@ -89,22 +96,118 @@ static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int
     mk4(g->main_k4, g->main_v4, g->main_k, g->main_v, Lm);
     mk4(g->sub_k4, g->sub_v4, g->sub_k, g->sub_v, Ls);
 
+    g->kv_buf = ggml_backend_alloc_ctx_tensors(g->kv_ctx, m->backend);
+    if (!g->kv_buf) {
+        fprintf(stderr, "[LeLM-gen] FATAL: KV alloc failed (S=%d)\n", S);
+        exit(1);
+    }
+    ggml_backend_buffer_clear(g->kv_buf, 0);
+}
+
+// Dynamic alloc: start at init_seq, allow growth up to cap_seq. Static alloc (cap==init)
+// reproduces the old behaviour exactly (no growth, one buffer sized to the full song).
+static void sggen_alloc_kv_dyn(SonggenLeLMGen * g, SonggenLeLM * m, int init_seq, int cap_seq, int n_sets) {
+    *g        = {};
+    g->m      = m;
+    g->n_sets = n_sets;
+    if (init_seq > cap_seq) init_seq = cap_seq;
+    if (init_seq < 1) init_seq = 1;
+    g->cap_seq = cap_seq;
+    sggen_build_kv_tensors(g, init_seq);
     for (int s = 0; s < n_sets; s++) {
         g->main_pos[s] = 0;
         g->sub_pos[s]  = 0;
     }
+    const SonggenConfig & c = m->cfg;
+    enum ggml_type        kvt = sggen_kv_type();
+    fprintf(stderr, "[LeLM-gen] KV: %d sets, main %dL + sub %dL, type=%s, S=%d (cap %d) -> %.1f MB (cap %.1f MB)\n",
+            n_sets, c.n_layers, c.n_layers_sub, ggml_type_name(kvt), init_seq, cap_seq,
+            (float) sggen_kv_bytes(c, n_sets, init_seq, kvt) / (1024 * 1024),
+            (float) sggen_kv_bytes(c, n_sets, cap_seq, kvt) / (1024 * 1024));
+}
 
-    g->kv_buf = ggml_backend_alloc_ctx_tensors(g->kv_ctx, m->backend);
-    if (!g->kv_buf) {
-        fprintf(stderr, "[LeLM-gen] FATAL: KV alloc failed\n");
-        exit(1);
+static void sggen_alloc_kv(SonggenLeLMGen * g, SonggenLeLM * m, int max_seq, int n_sets) {
+    sggen_alloc_kv_dyn(g, m, max_seq, max_seq, n_sets);  // static: init == cap (never grows)
+}
+
+// Stage the populated [0,used) prefix of every cache tensor to HOST, free the old GPU buffer,
+// build the new (bigger) buffer, then upload. Going via host means the old and new GPU buffers are
+// never co-resident — the grow transient is weights + max(old,new) KV, not old+new KV (which would
+// briefly ~double the KV term and spike the peak). nb[1] (D-row bytes) is capacity-independent, so
+// each (set,head) slab is a contiguous `used*nb[1]` run; raw byte move, KV-type-agnostic (no dequant).
+static void sggen_grow_kv(SonggenLeLMGen * g, int new_seq) {
+    if (new_seq > g->cap_seq) new_seq = g->cap_seq;
+    if (new_seq <= g->max_seq) return;
+    SonggenLeLM *         m  = g->m;
+    const SonggenConfig & c  = m->cfg;
+    int                   Lm = c.n_layers, Ls = c.n_layers_sub;
+    int                   used_main = g->main_pos[0];
+    int                   used_sub  = g->sub_pos[0];
+    for (int s = 1; s < g->n_sets; s++) {
+        if (g->main_pos[s] > used_main) used_main = g->main_pos[s];
+        if (g->sub_pos[s] > used_sub) used_sub = g->sub_pos[s];
     }
-    ggml_backend_buffer_clear(g->kv_buf, 0);
+    int     old_seq = g->max_seq;
+    int64_t t0      = ggml_time_us();
 
-    size_t kv_bytes = (size_t) n_sets * (Lm + Ls) * 2 * ((size_t) D * S * Nh / ggml_blck_size(kvt)) *
-                      ggml_type_size(kvt);
-    fprintf(stderr, "[LeLM-gen] KV: %d sets, main %dL + sub %dL, S=%d, type=%s -> %.1f MB\n", n_sets, Lm, Ls, S,
-            ggml_type_name(kvt), (float) kv_bytes / (1024 * 1024));
+    // 1) snapshot old GPU tensors → host (one staging buffer per tensor, freed as we go).
+    auto stage_down = [&](struct ggml_tensor *(&arr)[SGLM_MAX_LAYERS], int L, int used,
+                          std::vector<std::vector<char>> & host) {
+        int Nh = (int) arr[0]->ne[2], n_sets = (int) arr[0]->ne[3];
+        size_t seg = (size_t) used * arr[0]->nb[1];
+        for (int l = 0; l < L; l++) {
+            host[l].resize((size_t) n_sets * Nh * seg);
+            for (int s = 0; s < n_sets; s++)
+                for (int h = 0; h < Nh; h++)
+                    ggml_backend_tensor_get(arr[l], host[l].data() + ((size_t) s * Nh + h) * seg,
+                                            (size_t) s * arr[l]->nb[3] + (size_t) h * arr[l]->nb[2], seg);
+        }
+    };
+    std::vector<std::vector<char>> hmk(Lm), hmv(Lm), hsk(Ls), hsv(Ls);
+    if (used_main > 0) { stage_down(g->main_k4, Lm, used_main, hmk); stage_down(g->main_v4, Lm, used_main, hmv); }
+    if (used_sub > 0)  { stage_down(g->sub_k4, Ls, used_sub, hsk);  stage_down(g->sub_v4, Ls, used_sub, hsv); }
+
+    // 2) free old GPU buffer BEFORE allocating the new one (no co-residence).
+    struct ggml_context * old_ctx = g->kv_ctx;
+    ggml_backend_buffer_t old_buf = g->kv_buf;
+    ggml_backend_buffer_free(old_buf);
+    ggml_free(old_ctx);
+
+    // 3) build new (bigger) buffer and upload from host.
+    sggen_build_kv_tensors(g, new_seq);  // rebuilds g->kv_ctx/kv_buf/main_k4/.../views, sets max_seq
+    auto stage_up = [&](struct ggml_tensor *(&arr)[SGLM_MAX_LAYERS], int L, int used,
+                        std::vector<std::vector<char>> & host) {
+        int Nh = (int) arr[0]->ne[2], n_sets = (int) arr[0]->ne[3];
+        size_t seg = (size_t) used * arr[0]->nb[1];
+        for (int l = 0; l < L; l++)
+            for (int s = 0; s < n_sets; s++)
+                for (int h = 0; h < Nh; h++)
+                    ggml_backend_tensor_set(arr[l], host[l].data() + ((size_t) s * Nh + h) * seg,
+                                            (size_t) s * arr[l]->nb[3] + (size_t) h * arr[l]->nb[2], seg);
+    };
+    if (used_main > 0) { stage_up(g->main_k4, Lm, used_main, hmk); stage_up(g->main_v4, Lm, used_main, hmv); }
+    if (used_sub > 0)  { stage_up(g->sub_k4, Ls, used_sub, hsk);  stage_up(g->sub_v4, Ls, used_sub, hsv); }
+
+    enum ggml_type kvt = sggen_kv_type();
+    fprintf(stderr, "[LeLM-gen] KV grow %d -> %d (used main=%d sub=%d, %.1f MB, %.1f ms, host-bridged)\n", old_seq,
+            new_seq, used_main, used_sub, (float) sggen_kv_bytes(c, g->n_sets, new_seq, kvt) / (1024 * 1024),
+            (ggml_time_us() - t0) / 1000.0f);
+}
+
+// Ensure capacity for `need` total KV length. Grow geometrically (≈doubling) for ~linear total copy
+// cost, but cap the per-grow increment at SG_KV_GROW_BLOCK frames so we don't over-allocate (and
+// over-spike the grow transient) near the ceiling. Default 1500 (~60 s ≈ 600 MB q8_0 overshoot cap).
+static inline void sggen_ensure_kv(SonggenLeLMGen * g, int need) {
+    if (need <= g->max_seq) return;
+    static int blk = []() {
+        const char * e = getenv("SG_KV_GROW_BLOCK");
+        int          v = e ? atoi(e) : 1500;
+        return v > 0 ? v : 1500;
+    }();
+    int target = g->max_seq * 2;
+    if (target > g->max_seq + blk) target = g->max_seq + blk;
+    if (target < need) target = need;
+    sggen_grow_kv(g, target);
 }
 
 static void sggen_free_kv(SonggenLeLMGen * g) {
@@ -230,8 +333,9 @@ static void sggen_step(SonggenLeLMGen * g,
     int kv_pos_sub  = g->sub_pos[set];
     int kv_len_main = kv_pos_main + S;
     int kv_len_sub  = kv_pos_sub + S;
+    sggen_ensure_kv(g, kv_len_main > kv_len_sub ? kv_len_main : kv_len_sub);
     if (kv_len_main > g->max_seq) {
-        fprintf(stderr, "[LeLM-gen] FATAL: kv_len %d > max_seq %d\n", kv_len_main, g->max_seq);
+        fprintf(stderr, "[LeLM-gen] FATAL: kv_len %d > cap %d\n", kv_len_main, g->cap_seq);
         exit(1);
     }
 
@@ -528,8 +632,18 @@ static void sggen_step_batch(SonggenLeLMGen *                      g,
     }
     int kv_len_main = kv_pos_main + 1;
     int kv_len_sub  = kv_pos_sub + 1;
+    int kv_len      = kv_len_main > kv_len_sub ? kv_len_main : kv_len_sub;
+    // Round the FA KV-read up to a fixed 256 stride so the CUDA flash-attn decode kernel hits its
+    // 256-aligned fast path (~17% faster than a ragged length; ported from the acestep LM, qwen3-lm.h).
+    // The cache is zeroed at alloc/grow and the mask sets padded positions [kv_len, kv_read) to -inf,
+    // so the tail is numerically inert. Bucketing changes FP block-accumulation order → at temp=0 greedy
+    // a borderline argmax can flip (different-but-equivalent); SG_KV_BUCKET=1 reverts to ragged.
+    static const int KV_BUCKET = []() { const char * e = getenv("SG_KV_BUCKET"); return e ? atoi(e) : 256; }();
+    int kv_read = (KV_BUCKET <= 1) ? kv_len : ((kv_len + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET;
+    sggen_ensure_kv(g, kv_read);                       // buffer must cover the padded read
+    if (kv_read > g->max_seq) kv_read = g->max_seq;    // clamp at the hard ceiling (last bucket may be ragged)
     if (kv_len_main > g->max_seq) {
-        fprintf(stderr, "[LeLM-gen] FATAL: kv_len %d > max_seq %d\n", kv_len_main, g->max_seq);
+        fprintf(stderr, "[LeLM-gen] FATAL: kv_len %d > cap %d\n", kv_len_main, g->cap_seq);
         exit(1);
     }
 
@@ -555,7 +669,7 @@ static void sggen_step_batch(SonggenLeLMGen *                      g,
     struct ggml_tensor * seq2_t    = mk_ids("seq2", N);
     struct ggml_tensor * positions = mk_ids("positions", N);
 
-    struct ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len_main, 1, 1, N);
+    struct ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_read, 1, 1, N);
     ggml_set_name(mask, "mask");
     ggml_set_input(mask);
 
@@ -570,7 +684,7 @@ static void sggen_step_batch(SonggenLeLMGen *                      g,
     struct ggml_tensor * h1 = fin1;
     for (int l = 0; l < c.n_layers; l++) {
         h1 = sggen_layer_batch(ctx, gf, c, &m->main_layers[l], h1, positions, mask, g->main_k4[l], g->main_v4[l],
-                               kv_pos_main, kv_len_main, c.rope_theta, N);
+                               kv_pos_main, kv_read, c.rope_theta, N);
     }
     h1 = qwen3_rms_norm(ctx, h1, m->main_norm, c.rms_eps);
 
@@ -584,7 +698,7 @@ static void sggen_step_batch(SonggenLeLMGen *                      g,
     struct ggml_tensor * h2 = br;
     for (int l = 0; l < c.n_layers_sub; l++) {
         h2 = sggen_layer_batch(ctx, gf, c, &m->sub_layers[l], h2, positions, mask, g->sub_k4[l], g->sub_v4[l],
-                               kv_pos_sub, kv_len_sub, c.rope_theta_sub, N);
+                               kv_pos_sub, kv_read, c.rope_theta_sub, N);
     }
     h2 = qwen3_rms_norm(ctx, h2, m->sub_norm, c.rms_eps);
 
@@ -621,10 +735,13 @@ static void sggen_step_batch(SonggenLeLMGen *                      g,
         ggml_backend_tensor_set(positions, pos.data(), 0, N * sizeof(int32_t));
     }
     {
-        // causal mask [key=kv_len, 1, 1, N]: query (single, abs pos kv_pos) attends keys j<=kv_pos.
-        int                   KL = kv_len_main;
-        std::vector<uint16_t> md((size_t) KL * N, ggml_fp32_to_fp16(0.0f));  // all keys 0..kv_pos valid
-        ggml_backend_tensor_set(mask, md.data(), 0, (size_t) KL * N * sizeof(uint16_t));
+        // mask [key=kv_read, 1, 1, N]: the single query (abs pos kv_pos) attends real keys [0,kv_len);
+        // bucketed-pad positions [kv_len, kv_read) are -inf so the 256-aligned read tail is inert.
+        const uint16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<uint16_t> md((size_t) kv_read * N);
+        for (int n = 0; n < N; n++)
+            for (int j = 0; j < kv_read; j++) md[(size_t) n * kv_read + j] = (j < kv_len) ? z : ninf;
+        ggml_backend_tensor_set(mask, md.data(), 0, (size_t) kv_read * N * sizeof(uint16_t));
     }
 
     int64_t _tc0 = _prof ? ggml_time_us() : 0;

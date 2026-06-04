@@ -235,6 +235,7 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
         return;
     }
 
+    bool        has_duration = json_has(root, "duration");
     double      duration = json_get_num(root, "duration", 15.0);
     double      seed     = json_get_num(root, "seed", 1234.0);
     std::string gen_type = json_get_str(root, "gen_type", "mixed");
@@ -257,7 +258,7 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
         json_error(res, 400, "model must be one of: q8, q4");
         return;
     }
-    if (duration <= 0.0 || duration > (double) g_cfg.max_duration) {
+    if (has_duration && (duration <= 0.0 || duration > (double) g_cfg.max_duration)) {
         json_error(res, 400, "duration out of range");
         return;
     }
@@ -275,9 +276,12 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
         std::to_string((unsigned long long) seed),
         "--lyric", lyric,
         "--description", description,
-        "--duration", std::to_string(duration),
         "--gen-type", gen_type,
     };
+    // No "duration" in request → generate to the model max (270 s) and stop on EOS (upstream
+    // behaviour). Growing KV keeps VRAM proportional to the real length. An explicit duration is
+    // a hard cap (truncate) for bounding length/VRAM in a given bucket.
+    if (has_duration) { args.push_back("--duration"); args.push_back(std::to_string(duration)); }
     if (has_temp) { args.push_back("--temp");  args.push_back(std::to_string(temp)); }
     if (has_topk) { args.push_back("--top-k"); args.push_back(std::to_string((int) top_k)); }
     if (has_cfg)  { args.push_back("--cfg");   args.push_back(std::to_string(cfg)); }

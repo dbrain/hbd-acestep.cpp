@@ -96,9 +96,13 @@ int main(int argc, char ** argv) {
 
     // generation hyperparameters (lm_levo defaults / spec)
     SgGenParams P;
+    // No --duration/--frames given → generate to the model's max length (270 s) and let EOS stop
+    // the song naturally (upstream behaviour). --duration acts as an explicit hard cap (truncate)
+    // when you want to bound length/VRAM; growing KV keeps the footprint proportional to the actual
+    // (EOS-determined) length regardless of how high the ceiling is.
     if (frames_arg > 0)           P.max_gen_len = frames_arg;
     else if (duration_sec > 0.0f) P.max_gen_len = (int) lroundf(duration_sec * 25.0f);
-    else                          P.max_gen_len = 375;  // ~15 s @ 25 fps
+    else                          P.max_gen_len = SGGEN_MODEL_MAX_FRAMES;  // 270 s, EOS-terminated
     if (P.max_gen_len < 1) P.max_gen_len = 1;
     P.top_k    = arg_topk;
     P.temp     = arg_temp;
@@ -180,8 +184,15 @@ int main(int argc, char ** argv) {
     int start_offset = 1;  // first step with timestep 0 (cb0 delay 0 -> pattern pos 1)
 
     // ---- KV cache: cond=set0, uncond=set1 ----
+    // Dynamic/growing KV: cap is the full requested ceiling (prefix + pattern length), but we
+    // START small (prefix + conditioning + delay headroom) and grow geometrically only as the
+    // song actually generates. A high duration ceiling (for natural EOS / long songs) therefore
+    // costs only what's produced, not the ceiling — the binding VRAM term tracks real length.
     SonggenLeLMGen g;
-    sggen_alloc_kv(&g, &m, /*max_seq=*/c.desc_len + c.audio_len + c.type_len + S + 4, /*n_sets=*/2);
+    int cap_seq  = c.desc_len + c.audio_len + c.type_len + S + 4;
+    int init_seq = c.desc_len + c.audio_len + c.type_len + max_delay + 1 + 4;  // prefill + delay headroom
+    if (getenv("SG_KV_STATIC")) init_seq = cap_seq;  // A/B: force one-shot alloc (no growth)
+    sggen_alloc_kv_dyn(&g, &m, init_seq, cap_seq, /*n_sets=*/2);
 
     // ---- RNG ----
     std::mt19937_64 rng(seed);

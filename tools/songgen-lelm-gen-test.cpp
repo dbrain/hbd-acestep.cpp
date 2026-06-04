@@ -27,17 +27,31 @@ static double cossim(const float * a, const float * b, int n) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <gguf> <golden_dir>\n", argv[0]);
+        fprintf(stderr, "usage: %s <gguf> <golden_dir> [ref_gguf]\n"
+                        "  ref_gguf: oracle (full-prefill reference) weights; default = <gguf> (self-consistency).\n"
+                        "  Pass a near-lossless gguf (e.g. Q8_0) as a FIXED ruler to compare across weight quants.\n",
+                argv[0]);
         return 1;
     }
     std::string gguf = argv[1];
     std::string gd   = argv[2];
+    std::string ref  = argc > 3 ? argv[3] : gguf;  // oracle weights
     auto        gp   = [&](const char * f) { return gd + "/" + f; };
 
     SonggenLeLM m;
     if (!sglm_load(&m, gguf.c_str())) {
         fprintf(stderr, "load failed\n");
         return 1;
+    }
+    SonggenLeLM   mref_storage;
+    SonggenLeLM * pref = &m;  // oracle model (defaults to test model)
+    if (ref != gguf) {
+        if (!sglm_load(&mref_storage, ref.c_str())) {
+            fprintf(stderr, "ref load failed\n");
+            return 1;
+        }
+        pref = &mref_storage;
+        fprintf(stderr, "[gate] oracle ref = %s ; KV-decode test = %s\n", ref.c_str(), gguf.c_str());
     }
     const SonggenConfig & c    = m.cfg;
     const int             card = c.card;
@@ -82,7 +96,7 @@ int main(int argc, char ** argv) {
         return in;
     };
 
-    int N = 16;  // number of golden AR steps available
+    int N = T < 32 ? T : 32;  // teacher-forced AR steps to compare (oracle re-prefills each → O(N²))
 
     SonggenLeLMGen g;
     sggen_alloc_kv(&g, &m, /*max_seq=*/c.desc_len + c.audio_len + c.type_len + N + 4, /*n_sets=*/2);
@@ -93,6 +107,8 @@ int main(int argc, char ** argv) {
         or_cb[k].resize(card);
     }
 
+    auto argmax = [&](const float * v) { int b = 0; for (int i = 1; i < card; i++) if (v[i] > v[b]) b = i; return b; };
+    int  agree[3] = { 0, 0, 0 }, total = 0;  // teacher-forced argmax agreement (KV vs exact oracle)
     double min_s[2][3] = { { 1, 1, 1 }, { 1, 1, 1 } };
     printf("row step |   cb0      cb1      cb2\n");
     bool ok = true;
@@ -110,16 +126,18 @@ int main(int argc, char ** argv) {
             }
             sggen_step(&g, row, in, /*prepend=*/(p == 0), kv_cb[0].data(), kv_cb[1].data(), kv_cb[2].data());
 
-            // oracle full-prefill over prefix [0..p]
+            // oracle full-prefill over prefix [0..p] (reference weights pref; may differ from test m)
             SonggenCondInput full = make_full(cond, p + 1);
-            sglm_forward(&m, full, or_cb[0].data(), or_cb[1].data(), or_cb[2].data());
+            sglm_forward(pref, full, or_cb[0].data(), or_cb[1].data(), or_cb[2].data());
 
             double s[3];
             for (int k = 0; k < 3; k++) {
                 s[k] = cossim(kv_cb[k].data(), or_cb[k].data(), card);
                 if (s[k] < min_s[row][k]) min_s[row][k] = s[k];
                 if (s[k] < 0.999) ok = false;
+                if (argmax(kv_cb[k].data()) == argmax(or_cb[k].data())) agree[k]++;
             }
+            total++;
             printf("%3s %4d | %8.6f %8.6f %8.6f\n", cond ? "C" : "U", p, s[0], s[1], s[2]);
             fflush(stdout);
         }
@@ -129,6 +147,10 @@ int main(int argc, char ** argv) {
     for (int row = 0; row < 2; row++)
         printf("%s: cb0=%.6f cb1=%.6f cb2=%.6f\n", row == 0 ? "cond  " : "uncond", min_s[row][0], min_s[row][1],
                min_s[row][2]);
+    printf("---- argmax agreement vs exact oracle (teacher-forced, %d steps) ----\n", total);
+    printf("cb0(top1)=%d/%d (%.1f%%)  cb1=%d/%d (%.1f%%)  cb2=%d/%d (%.1f%%)\n", agree[0], total,
+           100.0 * agree[0] / total, agree[1], total, 100.0 * agree[1] / total, agree[2], total,
+           100.0 * agree[2] / total);
     printf("GATE-1: %s\n", ok ? "PASS (all >0.999)" : "FAIL (<0.999)");
 
     sggen_free_kv(&g);
