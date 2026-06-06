@@ -11,6 +11,7 @@
 
 #include "backend.h"
 #include "gguf-weights.h"
+#include "songgen-cache.h"
 
 #include <cmath>
 #include <cstdio>
@@ -91,7 +92,7 @@ static struct ggml_tensor * sgve_snake_gain(WeightCtx * w, const GGUFModel & gf,
     return t;
 }
 
-static bool sgve_load(SonggenVaeEnc * m, const char * gguf_path) {
+static bool sgve_load_real(SonggenVaeEnc * m, const char * gguf_path) {
     *m = {};
 
     BackendPair bp = backend_init("VAE-ENC");
@@ -269,7 +270,12 @@ static int sgve_encode(SonggenVaeEnc * m, const float * audio, int T_audio, std:
     return T_lat;
 }
 
+static bool sgve_load(SonggenVaeEnc * m, const char * gguf_path) {
+    return sgcache_load(gguf_path, m, sgve_load_real);
+}
+
 static void sgve_free(SonggenVaeEnc * m) {
+    if (g_sg_cache_on) return;  // resident in the warm-worker cache; freed on process exit
     if (m->sched) ggml_backend_sched_free(m->sched);
     backend_release(m->backend, m->cpu_backend);
     wctx_free(&m->wctx);

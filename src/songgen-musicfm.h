@@ -14,6 +14,7 @@
 
 #include "backend.h"
 #include "gguf-weights.h"
+#include "songgen-cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -124,7 +125,7 @@ static void sgmf_load_bn(SgMfBN * bn, WeightCtx * w, const GGUFModel & gf, const
     w->staging.push_back(std::move(hbuf));
 }
 
-static bool sgmf_load(SonggenMusicFM * m, const char * gguf_path) {
+static bool sgmf_load_real(SonggenMusicFM * m, const char * gguf_path) {
     *m = {};
     BackendPair bp = backend_init("MUSICFM");
     m->backend     = bp.backend;
@@ -553,7 +554,12 @@ static void sgmf_encode(SonggenMusicFM * m, const float * audio, int N, std::vec
     free(gbuf);
 }
 
+static bool sgmf_load(SonggenMusicFM * m, const char * gguf_path) {
+    return sgcache_load(gguf_path, m, sgmf_load_real);
+}
+
 static void sgmf_free(SonggenMusicFM * m) {
+    if (g_sg_cache_on) return;  // resident in the warm-worker cache; freed on process exit
     if (m->sched) ggml_backend_sched_free(m->sched);
     backend_release(m->backend, m->cpu_backend);
     wctx_free(&m->wctx);

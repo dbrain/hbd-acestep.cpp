@@ -16,6 +16,7 @@
 #include "backend.h"
 #include "gguf-weights.h"
 #include "qwen3-enc.h"  // Qwen3Layer, qwen3_linear, qwen3_rms_norm, qwen3_build_mlp, qwen3_attn_f32
+#include "songgen-cache.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -101,7 +102,7 @@ static void sglm_load_layer(WeightCtx * w, const GGUFModel & gf, Qwen3Layer * ly
     // q_norm/k_norm stay NULL: plain Llama, no QK-norm.
 }
 
-static bool sglm_load(SonggenLeLM * m, const char * gguf_path) {
+static bool sglm_load_real(SonggenLeLM * m, const char * gguf_path) {
     *m = {};
 
     BackendPair bp    = backend_init("LeLM");
@@ -443,7 +444,12 @@ static void sglm_forward(SonggenLeLM * m, const SonggenCondInput & in, float * c
     ggml_free(ctx);
 }
 
+static bool sglm_load(SonggenLeLM * m, const char * gguf_path) {
+    return sgcache_load(gguf_path, m, sglm_load_real);
+}
+
 static void sglm_free(SonggenLeLM * m) {
+    if (g_sg_cache_on) return;  // resident in the warm-worker cache; freed on process exit
     if (m->sched) ggml_backend_sched_free(m->sched);
     backend_release(m->backend, m->cpu_backend);
     wctx_free(&m->wctx);

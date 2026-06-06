@@ -240,11 +240,11 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
     struct ggml_tensor * tensor = ggml_new_tensor(wctx->ctx, GGML_TYPE_F32, n_dims, ne);
     ggml_set_name(tensor, name.c_str());
 
-    // Convert data into staging buffer. unique_ptr keeps .get() stable even
-    // when wctx->staging grows on subsequent calls.
-    size_t  n    = ggml_nelements(src);
-    auto    buf  = std::make_unique<float[]>(n);
-    float * data = buf.get();
+    // Convert data into staging buffer. The heap array keeps .get() stable even
+    // when wctx->staging grows on subsequent calls (shared_ptr for WeightCtx copyability).
+    size_t                  n    = ggml_nelements(src);
+    std::shared_ptr<float[]> buf(new float[n]);
+    float *                 data = buf.get();
 
     size_t       offset = gguf_get_tensor_offset(gf.gguf, idx);
     const void * raw    = gf.mapping + gf.data_offset + offset;
