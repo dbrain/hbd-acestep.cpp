@@ -37,6 +37,10 @@
 #include <string>
 #include <vector>
 
+#ifdef SONGGEN_AS_LIB
+namespace sgrun_clone {
+#endif
+
 static void stats(const char * tag, const float * a, size_t n) {
     double mn = 1e30, mx = -1e30, sum = 0, sq = 0;
     size_t n_bad = 0;
@@ -68,7 +72,11 @@ static float * read_stem(const char * path, int * T) {
     return p;
 }
 
+#ifdef SONGGEN_AS_LIB
+int run(int argc, char ** argv) {
+#else
 int main(int argc, char ** argv) {
+#endif
     std::string lyric, description, vocal_path, bgm_path, full_path, gen_type_s = "mixed";
     bool        have_lyric = false, have_desc = false;
     float       duration_sec = -1.0f, arg_temp = 1.0f, arg_cfg = 1.5f, arg_fade = 200.0f;
@@ -375,3 +383,7 @@ int main(int argc, char ** argv) {
     sgcfm_free(&cfm);
     return 0;
 }
+
+#ifdef SONGGEN_AS_LIB
+}  // namespace sgrun_clone
+#endif

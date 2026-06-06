@@ -25,6 +25,13 @@
 #include <string>
 #include <vector>
 
+// Built standalone as the songgen-generate CLI, OR compiled into songgen-server's
+// warm worker as sgrun_generate::run via -DSONGGEN_AS_LIB (model headers are pulled
+// in globally above this point so they stay shared/cached across the run_* entries).
+#ifdef SONGGEN_AS_LIB
+namespace sgrun_generate {
+#endif
+
 static void stats(const char * tag, const float * a, size_t n) {
     double mn = 1e30, mx = -1e30, sum = 0, sq = 0;
     size_t n_bad = 0;
@@ -41,7 +48,11 @@ static void stats(const char * tag, const float * a, size_t n) {
            var > 0 ? sqrt(var) : 0.0, n, n_bad);
 }
 
+#ifdef SONGGEN_AS_LIB
+int run(int argc, char ** argv) {
+#else
 int main(int argc, char ** argv) {
+#endif
     // Optional flags: --lyric "..." --description "..." (tokenize in C++ instead of
     // loading golden npy ids). Strip them out, leaving positional args intact.
     std::string lyric, description, gen_type_s = "mixed";
@@ -439,3 +450,7 @@ int main(int argc, char ** argv) {
     sgcfm_free(&cfm);
     return 0;
 }
+
+#ifdef SONGGEN_AS_LIB
+}  // namespace sgrun_generate
+#endif

@@ -162,6 +162,10 @@ link_ggml_backends(songgen-htdemucs-test)
 add_executable(songgen-separate tools/songgen-separate.cpp)
 link_ggml_backends(songgen-separate)
 
+# songgen-htdemucs-dump: dump every forward intermediate as raw f32 (CPU-vs-CUDA bisect)
+add_executable(songgen-htdemucs-dump tools/songgen-htdemucs-dump.cpp)
+link_ggml_backends(songgen-htdemucs-dump)
+
 # songgen-decode: SongGeneration audio decode driver (codes -> CFM ODE -> VAE -> wav)
 # header-only: songgen-cfm.h + songgen-vae.h + songgen-septoken.h + npy.h + wav.h
 add_executable(songgen-decode tools/songgen-decode.cpp)
@@ -211,12 +215,13 @@ target_link_libraries(ace-server PRIVATE acestep-core httplib)
 link_ggml_backends(ace-server)
 
 # songgen-server: HTTP API for the SongGeneration port.
-# v0 wraps the songgen-* CLIs via subprocess-exec (true process isolation:
-# model memory freed on child exit). No GPU/ggml linkage — it just shells out.
+# Subprocess-exec per request by default; with --worker-isolation it compiles the
+# songgen-generate/clone/continue bodies in-process (-DSONGGEN_AS_LIB) for a warm
+# fork+IPC worker, so it links ggml + the src/ headers like the other tools.
 add_executable(songgen-server tools/songgen-server.cpp)
 target_include_directories(songgen-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(songgen-server PRIVATE httplib yyjson Threads::Threads)
-add_dependencies(songgen-server version)
+target_link_libraries(songgen-server PRIVATE httplib yyjson)
+link_ggml_backends(songgen-server)
 
 add_executable(ace-understand tools/ace-understand.cpp)
 target_link_libraries(ace-understand PRIVATE acestep-core)

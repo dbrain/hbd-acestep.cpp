@@ -37,14 +37,18 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -141,7 +145,12 @@ static void stub_501(httplib::Response & res, const char * endpoint, const char 
 // subprocess exec: run argv, inherit stderr (logs), wait. Returns exit code or
 // -1 on spawn failure. No shell — argv is passed straight to execv.
 // ───────────────────────────────────────────────────────────────────────────
-static int run_subprocess(const std::vector<std::string> & args, const char * force_backend = nullptr) {
+// Runs argv as a child. If pid_out is non-null, the child pid is published there
+// before the blocking wait so a /job cancel (or /unload) can SIGKILL it mid-render
+// — the kill makes waitpid report a signal (not WIFEXITED) and we return -1, so the
+// caller finalizes the job as CANCELLED/FAILED and VRAM drops to true-0 on teardown.
+static int run_subprocess(const std::vector<std::string> & args, const char * force_backend = nullptr,
+                          std::atomic<pid_t> * pid_out = nullptr) {
     std::vector<char *> argv;
     argv.reserve(args.size() + 1);
     for (const auto & a : args) {
@@ -155,8 +164,7 @@ static int run_subprocess(const std::vector<std::string> & args, const char * fo
         return -1;
     }
     if (pid == 0) {
-        // Per-subprocess backend override: htdemucs separation is broken on CUDA (junk output)
-        // but correct on CPU, so /separate runs the child with GGML_BACKEND=CPU.
+        // Optional per-subprocess backend override (kept as a general hook).
         if (force_backend) {
             setenv("GGML_BACKEND", force_backend, 1);
         }
@@ -164,13 +172,155 @@ static int run_subprocess(const std::vector<std::string> & args, const char * fo
         fprintf(stderr, "[songgen-server] execv %s failed: %s\n", argv[0], strerror(errno));
         _exit(127);
     }
+    if (pid_out) {
+        pid_out->store(pid);
+    }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (pid_out) {
+        pid_out->store(-1);
     }
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
     }
     return -1;
+}
+
+static bool read_file(const std::string & path, std::string & out);  // defined below
+
+// Worker isolation (Stage 2): when on, renders run in a warm forked child that
+// keeps models resident across requests (this parent stays CUDA-free). Defined in
+// the worker block below; forward-declared here for job_run / job_cancel.
+static bool g_isolation = false;
+struct Job;
+static int  dispatch_job(std::shared_ptr<Job> job, const std::string & kind, const std::vector<std::string> & args);
+static void worker_unload();  // SIGKILL the warm child -> VRAM true-0
+
+// ───────────────────────────────────────────────────────────────────────────
+// Async job registry. The long endpoints (/generate, /clone, /continue) return a
+// job id immediately and run on a detached thread; the client polls /job. Cancel
+// SIGKILLs the running child (true-0 VRAM). GPU work stays serialized by
+// g_compute_mtx — at most one render runs at a time on this single GPU.
+// ───────────────────────────────────────────────────────────────────────────
+enum class JobStatus { PENDING, RUNNING, DONE, FAILED, CANCELLED };
+
+static const char * job_status_name(JobStatus s) {
+    switch (s) {
+        case JobStatus::PENDING:   return "pending";
+        case JobStatus::RUNNING:   return "running";
+        case JobStatus::DONE:      return "done";
+        case JobStatus::FAILED:    return "failed";
+        case JobStatus::CANCELLED: return "cancelled";
+    }
+    return "unknown";
+}
+
+static long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+struct Job {
+    std::string            id;
+    std::string            kind;                       // "generate" | "clone" | "continue"
+    std::atomic<JobStatus> status{ JobStatus::PENDING };
+    std::atomic<pid_t>     pid{ -1 };                  // running child (for cancel)
+    std::atomic<bool>      cancel{ false };
+    std::string              out_path;                 // wav written here on success
+    std::vector<std::string> cleanup;                  // temp upload files to unlink when done
+    std::string              mime = "audio/wav";
+    std::string              error;
+    long long              created_ms  = 0;
+    long long              started_ms  = 0;
+    long long              finished_ms = 0;
+};
+
+static std::mutex                                            g_jobs_mtx;
+static std::unordered_map<std::string, std::shared_ptr<Job>> g_jobs;
+
+static std::string new_job_id() {
+    static std::atomic<uint64_t> ctr{ 0 };
+    char                         buf[48];
+    snprintf(buf, sizeof(buf), "job-%lld-%llu", (long long) now_ms(), (unsigned long long) ctr.fetch_add(1));
+    return buf;
+}
+
+static std::shared_ptr<Job> job_get(const std::string & id) {
+    std::lock_guard<std::mutex> lk(g_jobs_mtx);
+    auto                        it = g_jobs.find(id);
+    return it == g_jobs.end() ? nullptr : it->second;
+}
+
+// Run a job's subprocess to completion (serialized on the GPU mutex), updating the
+// job's status. `args` is the full songgen-* argv; `out_path` is the wav target.
+static void job_run(std::shared_ptr<Job> job, std::vector<std::string> args) {
+    if (job->cancel.load()) {
+        job->status.store(JobStatus::CANCELLED);
+        return;
+    }
+    int rc;
+    {
+        std::lock_guard<std::mutex> lock(g_compute_mtx);
+        if (job->cancel.load()) {
+            job->status.store(JobStatus::CANCELLED);
+            return;
+        }
+        job->status.store(JobStatus::RUNNING);
+        job->started_ms = now_ms();
+        rc              = dispatch_job(job, job->kind, args);
+    }
+    job->finished_ms = now_ms();
+    std::string wav;
+    if (job->cancel.load()) {
+        job->status.store(JobStatus::CANCELLED);
+    } else if (rc == 0 && read_file(job->out_path, wav)) {
+        job->status.store(JobStatus::DONE);
+    } else {
+        if (job->error.empty()) {
+            job->error = "render failed (rc=" + std::to_string(rc) + ")";
+        }
+        job->status.store(JobStatus::FAILED);
+    }
+    unlink(job->out_path.c_str());
+    for (const auto & f : job->cleanup) {
+        unlink(f.c_str());
+    }
+}
+
+// Submit an async job: register it and detach the worker thread. Returns the id.
+static std::string job_submit(const std::string & kind, std::vector<std::string> args, const std::string & out_path,
+                              std::vector<std::string> cleanup = {}) {
+    auto job        = std::make_shared<Job>();
+    job->id         = new_job_id();
+    job->kind       = kind;
+    job->out_path   = out_path;
+    job->cleanup    = std::move(cleanup);
+    job->created_ms = now_ms();
+    {
+        std::lock_guard<std::mutex> lk(g_jobs_mtx);
+        g_jobs[job->id] = job;
+    }
+    std::thread(job_run, job, std::move(args)).detach();
+    return job->id;
+}
+
+// Cancel a job: flag it and SIGKILL the running child (reclaims VRAM immediately).
+// Subprocess model -> kill the per-job child; warm-worker model -> kill the worker
+// child (the active render dies; the worker re-spawns on the next request).
+static void job_cancel(std::shared_ptr<Job> job) {
+    job->cancel.store(true);
+    if (g_isolation) {
+        worker_unload();
+        fprintf(stderr, "[songgen-server] job %s cancelled -> worker killed (VRAM true-0)\n", job->id.c_str());
+        return;
+    }
+    pid_t p = job->pid.load();
+    if (p > 0) {
+        ::kill(p, SIGKILL);
+        fprintf(stderr, "[songgen-server] job %s cancelled -> child pid=%d killed (VRAM true-0)\n", job->id.c_str(),
+                (int) p);
+    }
 }
 
 static bool read_file(const std::string & path, std::string & out) {
@@ -214,6 +364,279 @@ static std::string unique_out_path() {
 //   fade         number  (optional ms, default 200)
 //   model        string  (optional, "q8"|"q4", default "q8")
 // returns: audio/wav (the generated song), or JSON error.
+// ───────────────────────────────────────────────────────────────────────────
+// Stage 2 — warm worker isolation (fork + length-prefixed IPC over a socketpair).
+//
+// When --worker-isolation is on, renders run in a long-lived forked child that this
+// (CUDA-free) parent talks to over a DATA socket. The child sets g_sg_cache_on so the
+// model loaders keep weights resident across requests — back-to-back jobs in one GPU
+// grant skip the ~12 s reload. Parent+child share the filesystem, so a RUN frame
+// marshals only the argv the parent already builds; the child writes the wav to the
+// shared tmpdir and the parent reads it back (no big-payload IPC). Cancel / idle /
+// /unload SIGKILL the child -> 100% VRAM reclaimed (true-0, no CUDA context here).
+// ───────────────────────────────────────────────────────────────────────────
+#define SONGGEN_AS_LIB
+#include "songgen-cache.h"
+#include "songgen-generate.cpp"  // -> sgrun_generate::run
+#include "songgen-clone.cpp"     // -> sgrun_clone::run
+#include "songgen-continue.cpp"  // -> sgrun_continue::run
+
+static int    g_argc = 0;
+static char **g_argv = nullptr;
+static bool   g_worker_mode    = false;  // this process is the forked child
+static int    g_worker_data_fd = -1;
+static int    g_idle_unload_seconds = 15;  // child SIGKILL'd after N idle s (env SG_IDLE_UNLOAD_SEC; 0=off)
+
+enum WJobKind : uint32_t { WK_GEN = 1, WK_CLONE = 2, WK_CONT = 3 };
+
+static uint32_t kind_code(const std::string & k) {
+    if (k == "clone")    return WK_CLONE;
+    if (k == "continue") return WK_CONT;
+    return WK_GEN;
+}
+
+enum class WFrame : uint32_t { HELLO = 1, RUN = 0x10, RESULT = 0x11 };
+struct WHdr {
+    uint32_t type, len, req;
+};
+
+static bool io_rw(int fd, void * buf, size_t len, bool write) {
+    char * p = (char *) buf;
+    size_t n = 0;
+    while (n < len) {
+        ssize_t r = write ? ::write(fd, p + n, len - n) : ::read(fd, p + n, len - n);
+        if (r > 0) { n += (size_t) r; continue; }
+        if (r == 0) return false;            // EOF
+        if (errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+static bool send_frame(int fd, WFrame t, const std::string & payload) {
+    WHdr h{ (uint32_t) t, (uint32_t) payload.size(), 0 };
+    if (!io_rw(fd, &h, sizeof(h), true)) return false;
+    return payload.empty() || io_rw(fd, (void *) payload.data(), payload.size(), true);
+}
+static bool recv_frame(int fd, WHdr * h, std::string * payload) {
+    if (!io_rw(fd, h, sizeof(*h), false)) return false;
+    if (h->len > (1u << 30)) return false;
+    payload->resize(h->len);
+    return h->len == 0 || io_rw(fd, &(*payload)[0], h->len, false);
+}
+
+// ── child side ──────────────────────────────────────────────────────────────
+static int worker_run_loop(int data_fd) {
+    g_sg_cache_on = true;  // keep loaded models resident across RUNs
+    if (!send_frame(data_fd, WFrame::HELLO, "ready")) return 1;
+    fprintf(stderr, "[songgen-worker] pid=%d ready (models load lazily + stay resident)\n", (int) getpid());
+    for (;;) {
+        WHdr        h{};
+        std::string pl;
+        if (!recv_frame(data_fd, &h, &pl)) break;  // parent gone -> exit (frees CUDA)
+        if ((WFrame) h.type != WFrame::RUN) continue;
+        // payload: [u32 kind][u32 argc][argc × (u32 len + bytes)]
+        size_t off = 0;
+        auto   rdu = [&](uint32_t & v) { if (off + 4 > pl.size()) { v = 0; return false; } std::memcpy(&v, pl.data() + off, 4); off += 4; return true; };
+        uint32_t kind = 0, argc = 0;
+        rdu(kind); rdu(argc);
+        std::vector<std::string> args;
+        for (uint32_t i = 0; i < argc; i++) {
+            uint32_t l = 0;
+            if (!rdu(l) || off + l > pl.size()) { argc = 0; break; }
+            args.emplace_back(pl.data() + off, l);
+            off += l;
+        }
+        std::vector<char *> cargv;
+        for (auto & a : args) cargv.push_back(const_cast<char *>(a.c_str()));
+        cargv.push_back(nullptr);
+        int rc = 127;
+        if (!args.empty()) {
+            int n = (int) args.size();
+            if (kind == WK_CLONE)      rc = sgrun_clone::run(n, cargv.data());
+            else if (kind == WK_CONT)  rc = sgrun_continue::run(n, cargv.data());
+            else                       rc = sgrun_generate::run(n, cargv.data());
+        }
+        std::string out(reinterpret_cast<const char *>(&rc), sizeof(rc));
+        if (!send_frame(data_fd, WFrame::RESULT, out)) break;
+    }
+    return 0;
+}
+
+// ── parent side ─────────────────────────────────────────────────────────────
+static std::mutex             g_wk_mtx;
+static pid_t                  g_wk_pid  = -1;
+static int                    g_wk_data = -1;
+static std::atomic<bool>      g_wk_busy{ false };
+static std::atomic<long long> g_wk_last_activity{ 0 };
+
+static pid_t worker_spawn(int * out_data) {
+    int sv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    pid_t pid = ::fork();
+    if (pid < 0) { ::close(sv[0]); ::close(sv[1]); return -1; }
+    if (pid == 0) {
+        ::close(sv[0]);
+        char dbuf[16];
+        std::snprintf(dbuf, sizeof(dbuf), "%d", sv[1]);
+        char wflag[] = "--worker";
+        std::vector<char *> a;
+        for (int i = 0; i < g_argc; i++) a.push_back(g_argv[i]);
+        a.push_back(wflag);
+        a.push_back(dbuf);
+        a.push_back(nullptr);
+        ::execv(g_argv[0], a.data());
+        ::_exit(127);
+    }
+    ::close(sv[1]);
+    *out_data = sv[0];
+    return pid;
+}
+
+static void kill_worker_locked() {  // caller holds g_wk_mtx
+    if (g_wk_pid > 0) {
+        ::kill(g_wk_pid, SIGKILL);
+        int ws = 0;
+        ::waitpid(g_wk_pid, &ws, 0);
+        fprintf(stderr, "[songgen-server] worker pid=%d killed -> VRAM true-0\n", (int) g_wk_pid);
+    }
+    if (g_wk_data >= 0) ::close(g_wk_data);
+    g_wk_pid  = -1;
+    g_wk_data = -1;
+}
+
+static bool ensure_worker_locked() {  // caller holds g_wk_mtx
+    if (g_wk_pid > 0) return true;
+    int   d   = -1;
+    pid_t pid = worker_spawn(&d);
+    if (pid < 0) { fprintf(stderr, "[songgen-server] worker spawn failed\n"); return false; }
+    WHdr        h{};
+    std::string pl;
+    if (!recv_frame(d, &h, &pl) || (WFrame) h.type != WFrame::HELLO) {
+        ::kill(pid, SIGKILL);
+        int ws = 0;
+        ::waitpid(pid, &ws, 0);
+        ::close(d);
+        fprintf(stderr, "[songgen-server] worker failed to start\n");
+        return false;
+    }
+    g_wk_pid  = pid;
+    g_wk_data = d;
+    fprintf(stderr, "[songgen-server] worker pid=%d spawned (isolation)\n", (int) pid);
+    return true;
+}
+
+static void worker_unload() {
+    if (!g_isolation) return;
+    std::lock_guard<std::mutex> lk(g_wk_mtx);
+    kill_worker_locked();
+}
+
+// Marshal one job to the worker and block for its RESULT rc. The blocking recv runs
+// WITHOUT g_wk_mtx so cancel/unload/watchdog can SIGKILL the child mid-render (which
+// makes the recv fail -> rc<0 -> job finalized as cancelled/failed).
+static int dispatch_remote(const std::string & kind, const std::vector<std::string> & args) {
+    int   data_fd;
+    pid_t pid;
+    {
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        if (!ensure_worker_locked()) return -1;
+        data_fd = g_wk_data;
+        pid     = g_wk_pid;
+        g_wk_busy.store(true);
+        std::string p;
+        auto        pku = [&](uint32_t v) { p.append((const char *) &v, 4); };
+        pku(kind_code(kind));
+        pku((uint32_t) args.size());
+        for (auto & a : args) { pku((uint32_t) a.size()); p.append(a); }
+        if (!send_frame(data_fd, WFrame::RUN, p)) {
+            kill_worker_locked();
+            g_wk_busy.store(false);
+            g_wk_last_activity.store(now_ms());
+            return -1;
+        }
+    }
+    WHdr        h{};
+    std::string resp;
+    bool        got = recv_frame(data_fd, &h, &resp) && (WFrame) h.type == WFrame::RESULT && resp.size() >= sizeof(int);
+    {
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        g_wk_busy.store(false);
+        g_wk_last_activity.store(now_ms());
+        if (!got) {
+            if (g_wk_pid == pid) kill_worker_locked();  // worker died (crash or SIGKILL)
+            return -1;
+        }
+    }
+    int rc = 0;
+    std::memcpy(&rc, resp.data(), sizeof(rc));
+    return rc;
+}
+
+// Idle watchdog: SIGKILL the worker once it has been idle (no in-flight RUN) for
+// g_idle_unload_seconds, dropping VRAM to true-0 between grants.
+static void worker_watchdog_main() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (g_idle_unload_seconds <= 0 || g_wk_busy.load()) continue;
+        long long thresh = (long long) g_idle_unload_seconds * 1000;
+        if (now_ms() - g_wk_last_activity.load() < thresh) continue;
+        std::lock_guard<std::mutex> lk(g_wk_mtx);
+        if (g_wk_pid > 0 && !g_wk_busy.load() && now_ms() - g_wk_last_activity.load() >= thresh) {
+            kill_worker_locked();
+        }
+    }
+}
+
+// dispatch a job either to the warm worker (isolation) or a fresh subprocess.
+static int dispatch_job(std::shared_ptr<Job> job, const std::string & kind, const std::vector<std::string> & args) {
+    if (g_isolation) {
+        return dispatch_remote(kind, args);
+    }
+    return run_subprocess(args, nullptr, &job->pid);
+}
+
+// Finalize a long compute request: async by default (register a job, return
+// {job_id} 202); ?wait=1 (or ?sync=1) blocks and streams the wav for simple
+// clients. /separate stays fully synchronous (it's fast) and does not use this.
+static void respond_compute(const httplib::Request & req, httplib::Response & res, const std::string & kind,
+                            std::vector<std::string> args, const std::string & out_wav,
+                            std::vector<std::string> cleanup = {}) {
+    bool want_sync = req.has_param("wait") || req.has_param("sync");
+    if (!want_sync) {
+        std::string      id   = job_submit(kind, std::move(args), out_wav, std::move(cleanup));
+        yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
+        yyjson_mut_val * root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_strcpy(doc, root, "job_id", id.c_str());
+        yyjson_mut_obj_add_str(doc, root, "status", "pending");
+        yyjson_mut_obj_add_str(doc, root, "poll", "GET /job?id=<job_id> (&download=1 for wav, &cancel=1 to cancel)");
+        char * out = yyjson_mut_write(doc, 0, nullptr);
+        res.status = 202;
+        res.set_content(out ? out : "{}", "application/json");
+        free(out);
+        yyjson_mut_doc_free(doc);
+        fprintf(stderr, "[songgen-server] /%s queued as %s\n", kind.c_str(), id.c_str());
+        return;
+    }
+    int rc;
+    {
+        std::lock_guard<std::mutex> lock(g_compute_mtx);
+        rc = g_isolation ? dispatch_remote(kind, args) : run_subprocess(args);
+    }
+    std::string wav;
+    bool        ok = (rc == 0) && read_file(out_wav, wav);
+    unlink(out_wav.c_str());
+    for (const auto & f : cleanup) {
+        unlink(f.c_str());
+    }
+    if (!ok) {
+        json_error(res, 500, rc != 0 ? "render failed" : "render produced no output");
+        return;
+    }
+    res.set_content(wav, "audio/wav");
+    fprintf(stderr, "[songgen-server] /%s done sync (%zu bytes)\n", kind.c_str(), wav.size());
+}
+
 static void handle_generate(const httplib::Request & req, httplib::Response & res) {
     yyjson_doc * doc = yyjson_read(req.body.c_str(), req.body.size(), 0);
     if (!doc) {
@@ -290,30 +713,7 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
     fprintf(stderr, "[songgen-server] /generate model=%s dur=%.1fs seed=%llu type=%s\n",
             model.c_str(), duration, (unsigned long long) seed, gen_type.c_str());
 
-    int rc;
-    {
-        std::lock_guard<std::mutex> lock(g_compute_mtx);  // serialize: one gen at a time
-        rc = run_subprocess(args);
-    }
-
-    if (rc != 0) {
-        unlink(out_wav.c_str());
-        char msg[128];
-        snprintf(msg, sizeof(msg), "generation failed (songgen-generate exit %d)", rc);
-        json_error(res, 500, msg);
-        return;
-    }
-
-    std::string wav;
-    if (!read_file(out_wav, wav)) {
-        unlink(out_wav.c_str());
-        json_error(res, 500, "generation produced no output");
-        return;
-    }
-    unlink(out_wav.c_str());
-
-    res.set_content(wav, "audio/wav");
-    fprintf(stderr, "[songgen-server] /generate done (%zu bytes)\n", wav.size());
+    respond_compute(req, res, "generate", std::move(args), out_wav);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -435,31 +835,11 @@ static void run_stem_job(const httplib::Request & req, httplib::Response & res, 
     fprintf(stderr, "[songgen-server] /%s model=%s dur=%.1fs seed=%llu type=%s\n",
             is_continue ? "continue" : "clone", model.c_str(), duration, (unsigned long long) seed, gen_type.c_str());
 
-    int rc;
-    {
-        std::lock_guard<std::mutex> lock(g_compute_mtx);
-        rc = run_subprocess(args);
+    std::vector<std::string> cleanup = { vocal, bgm };
+    if (!mix.empty()) {
+        cleanup.push_back(mix);
     }
-    unlink(vocal.c_str());
-    unlink(bgm.c_str());
-    if (!mix.empty()) unlink(mix.c_str());
-
-    if (rc != 0) {
-        unlink(out_wav.c_str());
-        char msg[128];
-        snprintf(msg, sizeof(msg), "%s failed (exit %d)", exe + 1, rc);
-        json_error(res, 500, msg);
-        return;
-    }
-    std::string wav;
-    if (!read_file(out_wav, wav)) {
-        unlink(out_wav.c_str());
-        json_error(res, 500, "no output produced");
-        return;
-    }
-    unlink(out_wav.c_str());
-    res.set_content(wav, "audio/wav");
-    fprintf(stderr, "[songgen-server] /%s done (%zu bytes)\n", is_continue ? "continue" : "clone", wav.size());
+    respond_compute(req, res, is_continue ? "continue" : "clone", std::move(args), out_wav, std::move(cleanup));
 }
 
 static void handle_clone(const httplib::Request & req, httplib::Response & res) {
@@ -484,7 +864,7 @@ static void handle_separate(const httplib::Request & req, httplib::Response & re
     int rc;
     {
         std::lock_guard<std::mutex> lock(g_compute_mtx);
-        rc = run_subprocess(args, /*force_backend=*/"CPU");  // htdemucs CUDA = broken; CPU is correct
+        rc = run_subprocess(args);  // htdemucs CUDA forward verified correct (cos 1.0 vs CPU) — run on GPU
     }
     unlink(mix.c_str());
     if (rc != 0) {
@@ -515,6 +895,93 @@ static void handle_separate(const httplib::Request & req, httplib::Response & re
     free(out);
     yyjson_mut_doc_free(doc);
     fprintf(stderr, "[songgen-server] /separate done (vocal %zu + bgm %zu bytes)\n", vwav.size(), bwav.size());
+}
+
+// GET /job?id=<id>            -> JSON status
+//     /job?id=<id>&download=1 -> the wav (audio/wav) once status==done
+//     /job?id=<id>&cancel=1   -> cancel a pending/running job (SIGKILL child -> true-0 VRAM)
+static void handle_job(const httplib::Request & req, httplib::Response & res) {
+    std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+    if (id.empty()) {
+        json_error(res, 400, "query param 'id' is required");
+        return;
+    }
+    auto job = job_get(id);
+    if (!job) {
+        json_error(res, 404, "unknown job id");
+        return;
+    }
+    if (req.has_param("cancel")) {
+        JobStatus s = job->status.load();
+        if (s == JobStatus::PENDING || s == JobStatus::RUNNING) {
+            job_cancel(job);
+        }
+    }
+    JobStatus st = job->status.load();
+    if (req.has_param("download")) {
+        if (st != JobStatus::DONE) {
+            json_error(res, 409, "job not done");
+            return;
+        }
+        std::string wav;
+        if (!read_file(job->out_path, wav)) {
+            // job_run already unlinked the wav after a previous successful poll-less finalize;
+            // results are streamed exactly once. Re-download is not supported.
+            json_error(res, 410, "result no longer available (already retrieved)");
+            return;
+        }
+        res.set_content(wav, job->mime);
+        return;
+    }
+    yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val * root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "job_id", id.c_str());
+    yyjson_mut_obj_add_strcpy(doc, root, "kind", job->kind.c_str());
+    yyjson_mut_obj_add_str(doc, root, "status", job_status_name(st));
+    if (st == JobStatus::DONE) {
+        yyjson_mut_obj_add_str(doc, root, "result", "GET /job?id=<id>&download=1");
+    }
+    if (st == JobStatus::FAILED && !job->error.empty()) {
+        yyjson_mut_obj_add_strcpy(doc, root, "error", job->error.c_str());
+    }
+    if (job->started_ms) {
+        long long end = job->finished_ms ? job->finished_ms : now_ms();
+        yyjson_mut_obj_add_int(doc, root, "elapsed_ms", end - job->started_ms);
+    }
+    char * out = yyjson_mut_write(doc, 0, nullptr);
+    res.set_content(out ? out : "{}", "application/json");
+    free(out);
+    yyjson_mut_doc_free(doc);
+}
+
+// POST /unload: cancel/kill any in-flight render so VRAM drops to true-0. The
+// subprocess worker model already holds no VRAM while idle (no resident weights,
+// no CUDA context in this parent), so this just tears down an active child.
+static void handle_unload(const httplib::Request &, httplib::Response & res) {
+    int killed = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_jobs_mtx);
+        for (auto & kv : g_jobs) {
+            JobStatus s = kv.second->status.load();
+            if (s == JobStatus::PENDING || s == JobStatus::RUNNING) {
+                job_cancel(kv.second);
+                killed++;
+            }
+        }
+    }
+    worker_unload();  // drop the resident warm worker (if any) -> true-0, even when idle
+    yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val * root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "ok");
+    yyjson_mut_obj_add_int(doc, root, "cancelled", killed);
+    yyjson_mut_obj_add_str(doc, root, "vram", "true-0 (no resident weights in the parent)");
+    char * out = yyjson_mut_write(doc, 0, nullptr);
+    res.set_content(out ? out : "{}", "application/json");
+    free(out);
+    yyjson_mut_doc_free(doc);
+    fprintf(stderr, "[songgen-server] /unload: cancelled %d in-flight job(s)\n", killed);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -548,10 +1015,19 @@ static std::string exe_dir() {
 
 int main(int argc, char ** argv) {
     g_cfg.bindir = exe_dir();
+    g_argc       = argc;
+    g_argv       = argv;
+    if (const char * e = getenv("SG_WORKER_ISOLATION")) g_isolation = atoi(e) != 0;
+    if (const char * e = getenv("SG_IDLE_UNLOAD_SEC")) g_idle_unload_seconds = atoi(e);
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--host" && i + 1 < argc) {
+        if (a == "--worker" && i + 1 < argc) {
+            g_worker_mode    = true;
+            g_worker_data_fd = atoi(argv[++i]);
+        } else if (a == "--worker-isolation") {
+            g_isolation = true;
+        } else if (a == "--host" && i + 1 < argc) {
             g_cfg.host = argv[++i];
         } else if (a == "--port" && i + 1 < argc) {
             g_cfg.port = atoi(argv[++i]);
@@ -575,6 +1051,11 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Forked worker child: serve RUN frames over the inherited socket; never binds HTTP.
+    if (g_worker_mode) {
+        return worker_run_loop(g_worker_data_fd);
+    }
+
     httplib::Server svr;
     g_svr = &svr;
     svr.set_read_timeout(600);
@@ -593,6 +1074,9 @@ int main(int argc, char ** argv) {
     svr.Post("/clone", handle_clone);
     svr.Post("/continue", handle_continue);
     svr.Post("/separate", handle_separate);
+    svr.Get("/job", handle_job);       // poll/download/cancel an async job
+    svr.Post("/job", handle_job);      // (POST accepted too, e.g. for &cancel=1)
+    svr.Post("/unload", handle_unload);  // GPU-guard preempt: kill in-flight -> true-0 VRAM
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -602,8 +1086,16 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[songgen-server] bindir=%s gguf=%s golden=%s\n", g_cfg.bindir.c_str(),
             g_cfg.gguf.c_str(), g_cfg.golden.c_str());
     fprintf(stderr, "[songgen-server] listening on %s:%d\n", g_cfg.host.c_str(), g_cfg.port);
-    fprintf(stderr, "[songgen-server] endpoints: GET /health, POST /generate, "
-                    "POST /clone|/continue|/separate (501 stubs)\n");
+    if (g_isolation) {
+        fprintf(stderr, "[songgen-server] worker isolation ON (warm resident models; idle-unload %ds; /unload -> true-0)\n",
+                g_idle_unload_seconds);
+        g_wk_last_activity.store(now_ms());
+        std::thread(worker_watchdog_main).detach();
+    } else {
+        fprintf(stderr, "[songgen-server] worker isolation OFF (subprocess per request; true-0 idle by teardown)\n");
+    }
+    fprintf(stderr, "[songgen-server] endpoints: GET /health, POST /generate|/clone|/continue (async: {job_id}; "
+                    "?wait=1 to block), POST /separate (sync), GET /job?id=, POST /unload\n");
 
     if (!svr.listen(g_cfg.host.c_str(), g_cfg.port)) {
         fprintf(stderr, "[songgen-server] FATAL: cannot bind %s:%d\n", g_cfg.host.c_str(), g_cfg.port);
