@@ -207,12 +207,34 @@ static bool write_wav_s16_planar(const char * path, const float * audio, int T_a
         fprintf(stderr, "[WAV] cannot open %s for writing\n", path);
         return false;
     }
+    // DEFAULT = uniform peak-normalize (attenuate-only): match the reference (torchaudio.save =
+    // no loudness processing) while guaranteeing no int16 clip. gain = peak>target ? target/peak : 1,
+    // so songs that already sit <=target are passed through untouched (exactly like the reference)
+    // and only the rare song whose transients exceed target is scaled DOWN — crest/dynamics intact.
+    // Verified: VAE+CFM scaling are bit-faithful to the reference (std ours/gold match), and on full
+    // songs our output is actually quieter + more dynamic than LeVo's; the old loudness-maximizing
+    // limiter squashed ~6 dB of crest and still pumped. SG_OUTPUT_LIMITER=1 restores the old limiter.
+    static const bool peaknorm = getenv("SG_OUTPUT_LIMITER") == NULL;
+    float             uniform_gain = 1.0f;
+    if (peaknorm && peak_target > 0.0f && T_audio > 0) {
+        const float * Lc = audio, * Rc = audio + T_audio;
+        float         gmax = 0.0f;
+        for (int i = 0; i < T_audio; i++) {
+            float l  = std::isfinite(Lc[i]) ? (Lc[i] < 0 ? -Lc[i] : Lc[i]) : 0.0f;
+            float r  = std::isfinite(Rc[i]) ? (Rc[i] < 0 ? -Rc[i] : Rc[i]) : 0.0f;
+            float pk = l > r ? l : r;
+            if (pk > gmax) gmax = pk;
+        }
+        uniform_gain = gmax > peak_target ? peak_target / gmax : 1.0f;
+        fprintf(stderr, "[WAV] peak-normalize: global peak %.3f -> uniform gain %.3f (crest preserved)\n",
+                gmax, uniform_gain);
+    }
     // Lookahead limiter (linked stereo, downward-only): forward window-MIN over [i,i+look]
     // gives the anticipation (gain is already reduced before any peak in the next `look`
     // samples, catching even single-sample impulses), then a slow release one-pole lets gain
     // recover smoothly after the peak passes. Applied directly (the window-min IS the lookahead).
     std::vector<float> glim;
-    if (peak_target > 0.0f && T_audio > 0) {
+    if (!peaknorm && peak_target > 0.0f && T_audio > 0) {
         const float * Lc   = audio;
         const float * Rc   = audio + T_audio;
         int           look = sr / 666 > 1 ? sr / 666 : 1;  // ~1.5ms anticipation
@@ -269,7 +291,7 @@ static bool write_wav_s16_planar(const char * path, const float * audio, int T_a
     const float * L = audio;
     const float * R = audio + T_audio;
     for (int t = 0; t < T_audio; t++) {
-        float g  = glim.empty() ? 1.0f : glim[t];
+        float g  = glim.empty() ? uniform_gain : glim[t];
         float lf = std::isfinite(L[t]) ? L[t] * g : 0.0f;
         float rf = std::isfinite(R[t]) ? R[t] * g : 0.0f;
         lf       = lf < -1.0f ? -1.0f : (lf > 1.0f ? 1.0f : lf);  // safety net (limiter already fits)
