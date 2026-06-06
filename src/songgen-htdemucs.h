@@ -21,12 +21,15 @@
 #include "gguf-weights.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef M_PI
@@ -937,9 +940,14 @@ struct HtdForwardOut {
 };
 
 static void htd_forward(SonggenHTDemucs * m, const float * mix, int N, int AC, HtdForwardOut * out) {
+    const bool htd_timing = getenv("HTD_TIMING") != nullptr;
+    auto       tnow       = [] { return std::chrono::steady_clock::now(); };
+    auto       tms        = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto       t0         = tnow();
     std::vector<float> mag, z_re, z_im;
     int Fr = 0, T = 0;
     htd_spec_cac(m, mix, N, AC, mag, z_re, z_im, &Fr, &T);
+    auto t_after_stft = tnow();
     int Cspec = 2 * AC;
 
     double smean, sstd, tmean, tstd;
@@ -1086,7 +1094,10 @@ static void htd_forward(SonggenHTDemucs * m, const float * mix, int N, int AC, H
     ggml_backend_tensor_set(pos2d, p2.data(), 0, p2.size() * sizeof(float));
     ggml_backend_tensor_set(pos1d, p1.data(), 0, p1.size() * sizeof(float));
 
+    auto t_before_gpu = tnow();
     ggml_backend_sched_graph_compute(m->sched, g);
+    if (htd_timing) ggml_backend_sched_synchronize(m->sched);
+    auto t_after_gpu = tnow();
 
     auto fetch = [&](struct ggml_tensor * t) {
         std::vector<float> v((size_t) ggml_nelements(t));
@@ -1139,19 +1150,34 @@ static void htd_forward(SonggenHTDemucs * m, const float * mix, int N, int AC, H
     out->stems.assign((size_t) S * AC * training_length, 0.f);
 
     // denorm: x*std + mean ; then CAC: for source s, audio ch a -> complex (re,im) = chan (s*4 + 2a, s*4 + 2a+1)
-    for (int s = 0; s < S; s++) {
-        for (int a = 0; a < AC; a++) {
-            int cre = s * (2 * AC) + 2 * a, cim = s * (2 * AC) + 2 * a + 1;
-            std::vector<float> zr((size_t) Ff2 * T), zi((size_t) Ff2 * T);
-            for (int f = 0; f < Ff2; f++)
-                for (int t = 0; t < T; t++) {
-                    zr[(size_t) f * T + t] = xspec[((size_t) cre * Ff2 + f) * T + t] * (float) sstd + (float) smean;
-                    zi[(size_t) f * T + t] = xspec[((size_t) cim * Ff2 + f) * T + t] * (float) sstd + (float) smean;
-                }
-            std::vector<float> wav;
-            htd_ispec_chan(m, zr.data(), zi.data(), Ff2, T, training_length, wav);
-            for (int t = 0; t < training_length; t++) out->stems[((size_t) s * AC + a) * training_length + t] = wav[t];
-        }
+    // The S*AC=8 channel reconstructions are independent (disjoint output slices, own buffers, m read-only),
+    // and the host iSTFT (radix-2 FFT) is the largest forward phase — parallelize across worker threads.
+    auto t_before_istft = tnow();
+    auto istft_one = [&](int s, int a) {
+        int cre = s * (2 * AC) + 2 * a, cim = s * (2 * AC) + 2 * a + 1;
+        std::vector<float> zr((size_t) Ff2 * T), zi((size_t) Ff2 * T);
+        for (int f = 0; f < Ff2; f++)
+            for (int t = 0; t < T; t++) {
+                zr[(size_t) f * T + t] = xspec[((size_t) cre * Ff2 + f) * T + t] * (float) sstd + (float) smean;
+                zi[(size_t) f * T + t] = xspec[((size_t) cim * Ff2 + f) * T + t] * (float) sstd + (float) smean;
+            }
+        std::vector<float> wav;
+        htd_ispec_chan(m, zr.data(), zi.data(), Ff2, T, training_length, wav);
+        for (int t = 0; t < training_length; t++) out->stems[((size_t) s * AC + a) * training_length + t] = wav[t];
+    };
+    {
+        int njobs = S * AC;
+        int nthreads = (int) std::thread::hardware_concurrency();
+        if (nthreads <= 0) nthreads = 4;
+        if (nthreads > njobs) nthreads = njobs;
+        std::vector<std::thread> pool;
+        std::atomic<int>         next{ 0 };
+        for (int w = 0; w < nthreads; w++)
+            pool.emplace_back([&] {
+                for (int job = next.fetch_add(1); job < njobs; job = next.fetch_add(1))
+                    istft_one(job / AC, job % AC);
+            });
+        for (auto & th : pool) th.join();
     }
     // ---- time branch: tdec_out[3] is [length, S*AC=8]; reshape [S, AC, length], denorm, add ----
     std::vector<float> xtime = out->tdec[3];  // [8, length] channel-major
@@ -1176,6 +1202,13 @@ static void htd_forward(SonggenHTDemucs * m, const float * mix, int N, int AC, H
         for (int t = 0; t < (int) cnt; t++) (void) spec_sq;
         fprintf(stderr, "[HTD_NORM] smean=%.5f sstd=%.5f tmean=%.5f tstd=%.5f | stem3ch0 rms=%.4f\n",
                 smean, sstd, tmean, tstd, sqrt(tot_sq / (double) cnt));
+    }
+    auto t_after_istft = tnow();
+    if (htd_timing) {
+        fprintf(stderr,
+                "[HTD_TIMING] stft=%.1fms graph_build=%.1fms gpu=%.1fms istft=%.1fms total=%.1fms\n",
+                tms(t0, t_after_stft), tms(t_after_stft, t_before_gpu), tms(t_before_gpu, t_after_gpu),
+                tms(t_before_istft, t_after_istft), tms(t0, t_after_istft));
     }
     fprintf(stderr, "[HTDEMUCS] forward graph %d nodes\n", ggml_graph_n_nodes(g));
     ggml_backend_sched_reset(m->sched);
