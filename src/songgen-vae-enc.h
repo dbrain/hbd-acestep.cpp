@@ -80,6 +80,17 @@ static struct ggml_tensor * sgve_f32(WeightCtx * w, const GGUFModel & gf, const 
     return gf_load_tensor_f32(w, gf, name);
 }
 
+// Load a snake gain ([C]) as [1, C] so the snake graph needs no in-chain reshape
+// (a reshape node breaks the MUL,SIN,SQR,MUL,ADD snake autofusion). See songgen-vae.h.
+static struct ggml_tensor * sgve_snake_gain(WeightCtx * w, const GGUFModel & gf, const std::string & name) {
+    struct ggml_tensor * t = gf_load_tensor_f32(w, gf, name);
+    GGML_ASSERT(ggml_n_dims(t) == 1 && ggml_is_contiguous(t));
+    t->ne[1] = t->ne[0];   // [C] -> [1, C]
+    t->ne[0] = 1;
+    t->nb[1] = t->nb[0];
+    return t;
+}
+
 static bool sgve_load(SonggenVaeEnc * m, const char * gguf_path) {
     *m = {};
 
@@ -121,23 +132,23 @@ static bool sgve_load(SonggenVaeEnc * m, const char * gguf_path) {
             SgVeResUnit & ru = b.ru[r];
             ru.dilation      = dils[r];
             std::string rp   = bpfx + ".res." + std::to_string(r);
-            ru.s1a           = sgve_f32(&m->wctx, gf, rp + ".snake1.alpha");
-            ru.s1bi          = sgve_f32(&m->wctx, gf, rp + ".snake1.beta_inv");
+            ru.s1a           = sgve_snake_gain(&m->wctx, gf, rp + ".snake1.alpha");
+            ru.s1bi          = sgve_snake_gain(&m->wctx, gf, rp + ".snake1.beta_inv");
             ru.c1w           = sgve_conv(&m->wctx, gf, rp + ".conv1.weight", b.in_ch, b.in_ch, 7);
             ru.c1b           = sgve_f32(&m->wctx, gf, rp + ".conv1.bias");
-            ru.s2a           = sgve_f32(&m->wctx, gf, rp + ".snake2.alpha");
-            ru.s2bi          = sgve_f32(&m->wctx, gf, rp + ".snake2.beta_inv");
+            ru.s2a           = sgve_snake_gain(&m->wctx, gf, rp + ".snake2.alpha");
+            ru.s2bi          = sgve_snake_gain(&m->wctx, gf, rp + ".snake2.beta_inv");
             ru.c2w           = sgve_conv(&m->wctx, gf, rp + ".conv2.weight", b.in_ch, b.in_ch, 1);
             ru.c2b           = sgve_f32(&m->wctx, gf, rp + ".conv2.bias");
         }
-        b.sa  = sgve_f32(&m->wctx, gf, bpfx + ".snake.alpha");
-        b.sbi = sgve_f32(&m->wctx, gf, bpfx + ".snake.beta_inv");
+        b.sa  = sgve_snake_gain(&m->wctx, gf, bpfx + ".snake.alpha");
+        b.sbi = sgve_snake_gain(&m->wctx, gf, bpfx + ".snake.beta_inv");
         b.cdw = sgve_conv(&m->wctx, gf, bpfx + ".conv_d.weight", b.out_ch, b.in_ch, b.kernel);
         b.cdb = sgve_f32(&m->wctx, gf, bpfx + ".conv_d.bias");
     }
 
-    m->sa     = sgve_f32(&m->wctx, gf, "snake_out.alpha");
-    m->sbi    = sgve_f32(&m->wctx, gf, "snake_out.beta_inv");
+    m->sa     = sgve_snake_gain(&m->wctx, gf, "snake_out.alpha");
+    m->sbi    = sgve_snake_gain(&m->wctx, gf, "snake_out.beta_inv");
     m->cout_w = sgve_conv(&m->wctx, gf, "conv_out.weight", 2 * m->latent_dim, 2048, 3);
     m->cout_b = sgve_f32(&m->wctx, gf, "conv_out.bias");
 
@@ -152,10 +163,10 @@ static bool sgve_load(SonggenVaeEnc * m, const char * gguf_path) {
 // Snake: y = x + sin(alpha*x)^2 * beta_inv.  x:[T,C]  alpha/beta_inv:[C].
 static struct ggml_tensor * sgve_snake(struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * alpha,
                                        struct ggml_tensor * beta_inv) {
-    struct ggml_tensor * a2 = ggml_reshape_2d(ctx, alpha, 1, alpha->ne[0]);
-    struct ggml_tensor * b2 = ggml_reshape_2d(ctx, beta_inv, 1, beta_inv->ne[0]);
-    struct ggml_tensor * s  = ggml_sin(ctx, ggml_mul(ctx, x, a2));
-    struct ggml_tensor * d  = ggml_mul(ctx, ggml_sqr(ctx, s), b2);
+    // alpha/beta_inv loaded as [1,C] (sgve_snake_gain) -> chain is MUL,SIN,SQR,MUL,ADD
+    // with no interleaved reshape, so ggml-cuda snake autofusion fires.
+    struct ggml_tensor * s = ggml_sin(ctx, ggml_mul(ctx, x, alpha));
+    struct ggml_tensor * d = ggml_mul(ctx, ggml_sqr(ctx, s), beta_inv);
     return ggml_add(ctx, x, d);
 }
 

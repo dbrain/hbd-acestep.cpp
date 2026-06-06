@@ -57,6 +57,19 @@ static struct ggml_tensor * sgvae_f32(WeightCtx * w, const GGUFModel & gf, const
     return gf_load_tensor_f32(w, gf, name);
 }
 
+// Load a snake gain ([C]) but present it as [1, C] so the snake graph needs no
+// in-chain ggml_reshape_2d. A reshape node lands between SQR and the 2nd MUL in
+// topological order, breaking the consecutive MUL,SIN,SQR,MUL,ADD pattern that
+// ggml-cuda's snake autofusion matches. Same contiguous data, reinterpreted.
+static struct ggml_tensor * sgvae_snake_gain(WeightCtx * w, const GGUFModel & gf, const std::string & name) {
+    struct ggml_tensor * t = gf_load_tensor_f32(w, gf, name);
+    GGML_ASSERT(ggml_n_dims(t) == 1 && ggml_is_contiguous(t));
+    t->ne[1] = t->ne[0];   // [C] -> [1, C]
+    t->ne[0] = 1;
+    t->nb[1] = t->nb[0];   // unit-stride columns (nb[2]/nb[3] already == C*type_size)
+    return t;
+}
+
 // Load ConvTranspose1d weight (torch [in,out,k]) into GEMM layout dst[IC, K*OC] with
 // column index oc*K+k (oc-major, matching ggml_col2im_1d), dst ne[0]=IC.
 static struct ggml_tensor * sgvae_conv_t(WeightCtx * w, const GGUFModel & gf, const std::string & name,
@@ -126,27 +139,27 @@ static bool sgvae_load(SonggenVae * m, const char * gguf_path) {
         b.stride       = strides[i];
         b.kernel       = strides[i] * 2;
         std::string bpfx = "block." + std::to_string(i);
-        b.sa           = sgvae_f32(&m->wctx, gf, bpfx + ".snake.alpha");
-        b.sbi          = sgvae_f32(&m->wctx, gf, bpfx + ".snake.beta_inv");
+        b.sa           = sgvae_snake_gain(&m->wctx, gf, bpfx + ".snake.alpha");
+        b.sbi          = sgvae_snake_gain(&m->wctx, gf, bpfx + ".snake.beta_inv");
         b.ctw          = sgvae_conv_t(&m->wctx, gf, bpfx + ".conv_t.weight", b.in_ch, b.out_ch, b.kernel);
         b.ctb          = sgvae_f32(&m->wctx, gf, bpfx + ".conv_t.bias");
         for (int r = 0; r < 3; r++) {
             SgVaeResUnit & ru = b.ru[r];
             ru.dilation       = dils[r];
             std::string rp    = bpfx + ".res." + std::to_string(r);
-            ru.s1a            = sgvae_f32(&m->wctx, gf, rp + ".snake1.alpha");
-            ru.s1bi           = sgvae_f32(&m->wctx, gf, rp + ".snake1.beta_inv");
+            ru.s1a            = sgvae_snake_gain(&m->wctx, gf, rp + ".snake1.alpha");
+            ru.s1bi           = sgvae_snake_gain(&m->wctx, gf, rp + ".snake1.beta_inv");
             ru.c1w            = sgvae_f32(&m->wctx, gf, rp + ".conv1.weight");
             ru.c1b            = sgvae_f32(&m->wctx, gf, rp + ".conv1.bias");
-            ru.s2a            = sgvae_f32(&m->wctx, gf, rp + ".snake2.alpha");
-            ru.s2bi           = sgvae_f32(&m->wctx, gf, rp + ".snake2.beta_inv");
+            ru.s2a            = sgvae_snake_gain(&m->wctx, gf, rp + ".snake2.alpha");
+            ru.s2bi           = sgvae_snake_gain(&m->wctx, gf, rp + ".snake2.beta_inv");
             ru.c2w            = sgvae_f32(&m->wctx, gf, rp + ".conv2.weight");
             ru.c2b            = sgvae_f32(&m->wctx, gf, rp + ".conv2.bias");
         }
     }
 
-    m->sa     = sgvae_f32(&m->wctx, gf, "snake_out.alpha");
-    m->sbi    = sgvae_f32(&m->wctx, gf, "snake_out.beta_inv");
+    m->sa     = sgvae_snake_gain(&m->wctx, gf, "snake_out.alpha");
+    m->sbi    = sgvae_snake_gain(&m->wctx, gf, "snake_out.beta_inv");
     m->cout_w = sgvae_f32(&m->wctx, gf, "conv_out.weight");
 
     if (!wctx_alloc(&m->wctx, m->backend)) {
@@ -159,13 +172,13 @@ static bool sgvae_load(SonggenVae * m, const char * gguf_path) {
 
 // ---- graph helpers ----
 
-// Snake: y = x + sin(alpha*x)^2 * beta_inv.  x:[T,C]  alpha/beta_inv:[C] (broadcast over T)
+// Snake: y = x + sin(alpha*x)^2 * beta_inv.  x:[T,C]  alpha/beta_inv:[1,C] (broadcast over T)
+// alpha/beta_inv are loaded as [1,C] (sgvae_snake_gain) so the chain emits exactly
+// MUL,SIN,SQR,MUL,ADD with no interleaved reshape -> ggml-cuda snake autofusion fires.
 static struct ggml_tensor * sgvae_snake(struct ggml_context * ctx, struct ggml_tensor * x,
                                         struct ggml_tensor * alpha, struct ggml_tensor * beta_inv) {
-    struct ggml_tensor * a2 = ggml_reshape_2d(ctx, alpha, 1, alpha->ne[0]);
-    struct ggml_tensor * b2 = ggml_reshape_2d(ctx, beta_inv, 1, beta_inv->ne[0]);
-    struct ggml_tensor * s  = ggml_sin(ctx, ggml_mul(ctx, x, a2));
-    struct ggml_tensor * d  = ggml_mul(ctx, ggml_sqr(ctx, s), b2);
+    struct ggml_tensor * s = ggml_sin(ctx, ggml_mul(ctx, x, alpha));
+    struct ggml_tensor * d = ggml_mul(ctx, ggml_sqr(ctx, s), beta_inv);
     return ggml_add(ctx, x, d);
 }
 
