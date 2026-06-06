@@ -94,25 +94,33 @@ static void sgclone_stem_to_24k_mono(const float * stem_planar, int n_in, int sr
 // would differ slightly at segment seams; flagged for future work.
 static void sgclone_encode_stream(SonggenMusicFM * mf, const SgRvqStream & rvq, int layer,
                                   const std::vector<float> & audio24, std::vector<int> & codes_out) {
-    const int min24 = 40 * 24000;
-    int       orig  = (int) audio24.size();
+    // The reference (sound2code) tiles the clip to >= one 40s segment, encodes whole 40s segments
+    // independently, concatenates the codes, and trims to output_len. Only the first output_len frames
+    // are ever kept, and they come from the EARLIEST segments. Two consequences we exploit:
+    //   A (bit-exact): encode only as many segments as are needed to reach output_len, then stop. The
+    //     old code always encoded int_max_len(+1)-doubled segments (e.g. 2x 40s for a <=40s clip) and
+    //     threw the tail away — pure wasted compute. seg0 already yields 40s*25=1000 frames >> output_len.
+    //   B (VRAM, opt-in via SG_CLONE_MIN_SEC<40): shrink the segment length. The 40s forward is the peak
+    //     VRAM driver; a shorter segment cuts the conformer activation peak. NOT bit-exact — the conformer
+    //     self-attn is global, so a shorter (fewer-repeats) context shifts the codes. Validate the leading-
+    //     frame agreement with songgen-clone-encode-test before changing the default.
+    int min_sec = 40;
+    if (const char * e = getenv("SG_CLONE_MIN_SEC")) { int v = atoi(e); if (v > 0) min_sec = v; }
+    const int min24      = min_sec * 24000;
+    int       orig       = (int) audio24.size();
     int       output_len = (int) ((double) orig / 24000.0 * 25.0) + 1;
 
-    std::vector<float> a = audio24;
-    while ((int) a.size() < min24) {
-        size_t s = a.size();
-        a.insert(a.end(), a.begin(), a.begin() + s);  // cat([a,a])
-    }
-    int int_max_len = (int) a.size() / min24 + 1;
-    {
-        size_t s = a.size();
-        a.insert(a.end(), a.begin(), a.begin() + s);  // cat([a,a]) again
-    }
-    a.resize((size_t) int_max_len * min24);  // trim to int_max_len whole segments
+    // segments needed to cover output_len kept frames (25 frames/s -> 960 samples/frame), + 1 slack.
+    int n_seg = (int) (((int64_t) output_len * 960 + min24 - 1) / min24) + 1;
 
-    int n_seg = int_max_len;
+    // tile the clip (repeat-original == the reference's doubling sequence) to n_seg whole segments.
+    std::vector<float> a;
+    a.reserve((size_t) n_seg * min24);
+    while ((int64_t) a.size() < (int64_t) n_seg * min24) a.insert(a.end(), audio24.begin(), audio24.end());
+    a.resize((size_t) n_seg * min24);
+
     codes_out.clear();
-    for (int seg = 0; seg < n_seg; seg++) {
+    for (int seg = 0; seg < n_seg && (int) codes_out.size() < output_len; seg++) {
         const float *                   sa = &a[(size_t) seg * min24];
         std::vector<std::vector<float>> layers;
         int                             T = 0;
