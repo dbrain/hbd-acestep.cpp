@@ -229,6 +229,8 @@ struct Job {
     std::atomic<bool>      cancel{ false };
     std::string              out_path;                 // wav written here on success
     std::vector<std::string> cleanup;                  // temp upload files to unlink when done
+    std::vector<std::string> pre_args;                 // optional pre-step argv (htdemucs separation) run before the render
+    std::string              result;                   // rendered wav bytes, retained in memory for download (once-only)
     std::string              mime = "audio/wav";
     std::string              error;
     long long              created_ms  = 0;
@@ -268,13 +270,29 @@ static void job_run(std::shared_ptr<Job> job, std::vector<std::string> args) {
         }
         job->status.store(JobStatus::RUNNING);
         job->started_ms = now_ms();
-        rc              = dispatch_job(job, job->kind, args);
+        rc              = 0;
+        if (!job->pre_args.empty()) {
+            // Pre-step: htdemucs separation of the full mix into vocal+bgm stems
+            // (always its own subprocess, even in worker-isolation mode). The main
+            // render argv references the stem paths this writes. SIGKILLable via pid.
+            rc = run_subprocess(job->pre_args, nullptr, &job->pid);
+            if (rc != 0 && job->error.empty()) {
+                job->error = "stem separation failed (rc=" + std::to_string(rc) + ")";
+            }
+        }
+        if (rc == 0 && !job->cancel.load()) {
+            rc = dispatch_job(job, job->kind, args);
+        }
     }
     job->finished_ms = now_ms();
     std::string wav;
     if (job->cancel.load()) {
         job->status.store(JobStatus::CANCELLED);
     } else if (rc == 0 && read_file(job->out_path, wav)) {
+        // Retain the bytes in memory; the temp file is unlinked below. The client
+        // polls /job (status only) then fetches /job?download=1 — serving from disk
+        // would race the cleanup, so we keep the result and stream it once.
+        job->result = std::move(wav);
         job->status.store(JobStatus::DONE);
     } else {
         if (job->error.empty()) {
@@ -290,12 +308,13 @@ static void job_run(std::shared_ptr<Job> job, std::vector<std::string> args) {
 
 // Submit an async job: register it and detach the worker thread. Returns the id.
 static std::string job_submit(const std::string & kind, std::vector<std::string> args, const std::string & out_path,
-                              std::vector<std::string> cleanup = {}) {
+                              std::vector<std::string> cleanup = {}, std::vector<std::string> pre_args = {}) {
     auto job        = std::make_shared<Job>();
     job->id         = new_job_id();
     job->kind       = kind;
     job->out_path   = out_path;
     job->cleanup    = std::move(cleanup);
+    job->pre_args   = std::move(pre_args);
     job->created_ms = now_ms();
     {
         std::lock_guard<std::mutex> lk(g_jobs_mtx);
@@ -305,21 +324,49 @@ static std::string job_submit(const std::string & kind, std::vector<std::string>
     return job->id;
 }
 
+// Reaper: terminal jobs (and their retained wav bytes) linger in g_jobs so the
+// client can poll then download; without this they'd accumulate forever. Drop any
+// finished job older than the TTL — far longer than the poll→download gap.
+static constexpr long long JOB_TTL_MS = 30 * 60 * 1000;  // 30 minutes
+
+static void jobs_reaper() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::minutes(5));
+        long long now = now_ms();
+        std::lock_guard<std::mutex> lk(g_jobs_mtx);
+        for (auto it = g_jobs.begin(); it != g_jobs.end();) {
+            JobStatus s        = it->second->status.load();
+            bool      terminal = s == JobStatus::DONE || s == JobStatus::FAILED || s == JobStatus::CANCELLED;
+            long long stamp    = it->second->finished_ms ? it->second->finished_ms : it->second->created_ms;
+            if (terminal && now - stamp > JOB_TTL_MS) {
+                it = g_jobs.erase(it);  // shared_ptr keeps any in-flight download alive
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
 // Cancel a job: flag it and SIGKILL the running child (reclaims VRAM immediately).
 // Subprocess model -> kill the per-job child; warm-worker model -> kill the worker
 // child (the active render dies; the worker re-spawns on the next request).
 static void job_cancel(std::shared_ptr<Job> job) {
     job->cancel.store(true);
-    if (g_isolation) {
-        worker_unload();
-        fprintf(stderr, "[songgen-server] job %s cancelled -> worker killed (VRAM true-0)\n", job->id.c_str());
-        return;
-    }
+    // Kill the current child if one is running. run_subprocess resets pid to -1
+    // once a child exits, so this never targets a stale/reused pid. This covers
+    // the non-isolation render child AND a separation pre-step (which always runs
+    // as its own subprocess, even under worker isolation).
     pid_t p = job->pid.load();
     if (p > 0) {
         ::kill(p, SIGKILL);
         fprintf(stderr, "[songgen-server] job %s cancelled -> child pid=%d killed (VRAM true-0)\n", job->id.c_str(),
                 (int) p);
+    }
+    // In worker-isolation mode the render runs in the warm worker (not a tracked
+    // child) — tear it down too so VRAM drops to true-0.
+    if (g_isolation) {
+        worker_unload();
+        fprintf(stderr, "[songgen-server] job %s cancelled -> worker killed (VRAM true-0)\n", job->id.c_str());
     }
 }
 
@@ -600,10 +647,10 @@ static int dispatch_job(std::shared_ptr<Job> job, const std::string & kind, cons
 // clients. /separate stays fully synchronous (it's fast) and does not use this.
 static void respond_compute(const httplib::Request & req, httplib::Response & res, const std::string & kind,
                             std::vector<std::string> args, const std::string & out_wav,
-                            std::vector<std::string> cleanup = {}) {
+                            std::vector<std::string> cleanup = {}, std::vector<std::string> pre_args = {}) {
     bool want_sync = req.has_param("wait") || req.has_param("sync");
     if (!want_sync) {
-        std::string      id   = job_submit(kind, std::move(args), out_wav, std::move(cleanup));
+        std::string      id   = job_submit(kind, std::move(args), out_wav, std::move(cleanup), std::move(pre_args));
         yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
         yyjson_mut_val * root = yyjson_mut_obj(doc);
         yyjson_mut_doc_set_root(doc, root);
@@ -618,10 +665,15 @@ static void respond_compute(const httplib::Request & req, httplib::Response & re
         fprintf(stderr, "[songgen-server] /%s queued as %s\n", kind.c_str(), id.c_str());
         return;
     }
-    int rc;
+    int rc = 0;
     {
         std::lock_guard<std::mutex> lock(g_compute_mtx);
-        rc = g_isolation ? dispatch_remote(kind, args) : run_subprocess(args);
+        if (!pre_args.empty()) {
+            rc = run_subprocess(pre_args);  // htdemucs separation pre-step (mix -> stems)
+        }
+        if (rc == 0) {
+            rc = g_isolation ? dispatch_remote(kind, args) : run_subprocess(args);
+        }
     }
     std::string wav;
     bool        ok = (rc == 0) && read_file(out_wav, wav);
@@ -788,12 +840,28 @@ static void run_stem_job(const httplib::Request & req, httplib::Response & res, 
     }
     std::string vocal = save_upload(req, "vocal_stem");
     std::string bgm   = save_upload(req, "bgm_stem");
-    std::string mix   = save_upload(req, "full_mix");  // optional
-    if (vocal.empty() || bgm.empty()) {
+    std::string mix   = save_upload(req, "full_mix");  // optional reference / auto-separation source
+    if (mix.empty()) {
+        mix = save_upload(req, "mix");                 // accept 'mix' as an alias for 'full_mix'
+    }
+
+    // Auto-separate: if the caller didn't supply pre-split stems but did give a full
+    // mix, run htdemucs ourselves (a pre-step inside this job) to derive vocal+bgm,
+    // then clone over them. The original mix is still passed as --full-mix (reference).
+    std::vector<std::string> pre_args;
+    if ((vocal.empty() || bgm.empty()) && !mix.empty()) {
+        if (!vocal.empty()) unlink(vocal.c_str());
+        if (!bgm.empty())   unlink(bgm.c_str());
+        vocal    = unique_out_path();
+        bgm      = unique_out_path();
+        pre_args = { g_cfg.bindir + "/songgen-separate", gguf_path("songgen-htdemucs.gguf"),
+                     mix, vocal, bgm };
+    } else if (vocal.empty() || bgm.empty()) {
         if (!vocal.empty()) unlink(vocal.c_str());
         if (!bgm.empty())   unlink(bgm.c_str());
         if (!mix.empty())   unlink(mix.c_str());
-        json_error(res, 400, "both 'vocal_stem' and 'bgm_stem' audio files are required");
+        json_error(res, 400,
+                   "provide both 'vocal_stem' and 'bgm_stem', or a 'full_mix'/'mix' to auto-separate");
         return;
     }
 
@@ -839,7 +907,8 @@ static void run_stem_job(const httplib::Request & req, httplib::Response & res, 
     if (!mix.empty()) {
         cleanup.push_back(mix);
     }
-    respond_compute(req, res, is_continue ? "continue" : "clone", std::move(args), out_wav, std::move(cleanup));
+    respond_compute(req, res, is_continue ? "continue" : "clone", std::move(args), out_wav, std::move(cleanup),
+                    std::move(pre_args));
 }
 
 static void handle_clone(const httplib::Request & req, httplib::Response & res) {
@@ -924,13 +993,17 @@ static void handle_job(const httplib::Request & req, httplib::Response & res) {
             return;
         }
         std::string wav;
-        if (!read_file(job->out_path, wav)) {
-            // job_run already unlinked the wav after a previous successful poll-less finalize;
-            // results are streamed exactly once. Re-download is not supported.
+        {
+            // Take the retained bytes (once-only). job_run keeps the result in
+            // memory and unlinks the temp file; re-download is not supported.
+            std::lock_guard<std::mutex> lk(g_jobs_mtx);
+            wav.swap(job->result);
+        }
+        if (wav.empty()) {
             json_error(res, 410, "result no longer available (already retrieved)");
             return;
         }
-        res.set_content(wav, job->mime);
+        res.set_content(std::move(wav), job->mime);
         return;
     }
     yyjson_mut_doc * doc  = yyjson_mut_doc_new(nullptr);
@@ -1055,6 +1128,8 @@ int main(int argc, char ** argv) {
     if (g_worker_mode) {
         return worker_run_loop(g_worker_data_fd);
     }
+
+    std::thread(jobs_reaper).detach();  // bound g_jobs growth (terminal jobs + retained wavs)
 
     httplib::Server svr;
     g_svr = &svr;
