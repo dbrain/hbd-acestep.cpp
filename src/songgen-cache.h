@@ -1,43 +1,35 @@
 #pragma once
-// songgen-cache.h: opt-in resident model cache for the warm worker.
+// songgen-cache.h: warm-worker memory model.
 //
-// When g_sg_cache_on is true (set only by songgen-server's --worker child), the
-// model loaders (sglm_load / sgcfm_load / sgvae_load / sgsep_load / sgmf_load /
-// sgvaeenc_load) keep each loaded model resident keyed by gguf path and hand back
-// a shallow copy on a repeat load, and the matching *_free becomes a no-op. This
-// lets the warm worker serve back-to-back requests within a GPU grant without
-// reloading ~7 GB of ggufs. The cache is process-local; SIGKILL on /unload or the
-// idle watchdog reclaims everything to true-0 (the loaders mmap MAP_PRIVATE, no
-// mlock, so resident host RAM is reclaimable page cache, not pinned).
+// g_sg_cache_on is set true in songgen-server's --worker child. The worker keeps
+// the PROCESS warm across requests — its CUDA context stays initialised and the
+// MAP_PRIVATE gguf mmaps stay in the OS page cache — but GPU weight BUFFERS are
+// still freed per stage, exactly like a standalone run. That's load-bearing on a
+// 12 GB card: songgen-generate frees the LeLM (sglm_free) before the CFM/VAE
+// decode stage, so the render peak is max(LM-stage, decode-stage) — NOT their
+// sum. An earlier version retained every loaded model GPU-resident (no-op free)
+// for back-to-back reuse; that made the decode buffer STACK on ~7 GB of resident
+// weights (peak ~9-13 GB, growing across requests) for a ~2 s wall saving. The
+// right trade is per-stage free + warm host: a reload is an H2D copy from the
+// warm page cache (~0.4 s / 5 GB), not a disk read, so the worker stays "as warm
+// as a normal run" while the peak stays at the single-stage max (~7.5 GB).
 //
-// Default OFF → the standalone CLI tools and golden tests load/free exactly as
-// before (the cache code is inert). The model structs hold only raw ggml pointers
-// + small std::vector metadata (no owning smart pointers), so the shallow copy
-// shares the ggml resources and the no-op free avoids any double-free.
+// Idle watchdog / /unload SIGKILLs the worker → true-0 (mmaps are reclaimable
+// page cache, no mlock). Golden tests / CLI tools run with the flag off and are
+// byte-identical either way.
 
-#include <map>
 #include <string>
 
-// Set true exactly once, in the worker child, before serving any job.
+// Set true exactly once, in the worker child, before serving any job. Read here
+// only to document the warm-worker path; residency is intentionally NOT kept.
 static bool g_sg_cache_on = false;
 
-// Cache helper for a model type T loaded by `loader(T*, path)`. Returns true and
-// fills *out from cache on a hit; on a miss runs `loader`, stores a copy, returns
-// its result. With the cache off it just calls the loader (no residency).
+// Load helper for a model type T loaded by `loader(T*, path)`. Always loads fresh
+// (no GPU-buffer residency) so the matching *_free really frees per stage; the
+// worker's warmth comes from the persistent process + page cache, not resident
+// GPU buffers.
 template <typename T, typename Loader>
 static bool sgcache_load(const char * path, T * out, Loader loader) {
-    if (!g_sg_cache_on) {
-        return loader(out, path);
-    }
-    static std::map<std::string, T> cache;
-    auto                            it = cache.find(path);
-    if (it != cache.end()) {
-        *out = it->second;
-        return true;
-    }
-    if (!loader(out, path)) {
-        return false;
-    }
-    cache[path] = *out;  // shallow copy: shares ggml resources, freed only on process exit
-    return true;
+    (void) g_sg_cache_on;
+    return loader(out, path);
 }

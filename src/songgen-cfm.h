@@ -367,7 +367,6 @@ static bool sgcfm_load(SonggenCfm * m, const char * gguf_path) {
 }
 
 static void sgcfm_free(SonggenCfm * m) {
-    if (g_sg_cache_on) return;  // resident in the warm-worker cache; freed on process exit
     if (m->sched) ggml_backend_sched_free(m->sched);
     backend_release(m->backend, m->cpu_backend);
     wctx_free(&m->wctx);
