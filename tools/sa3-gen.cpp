@@ -21,6 +21,7 @@
 #include "sa3-dit.h"
 #include "sa3-same.h"
 #include "sa3-same-enc.h"
+#include "sa3-cache.h"
 #include "wav.h"
 
 #include <chrono>
@@ -30,6 +31,13 @@
 #include <random>
 #include <string>
 #include <vector>
+
+// Built standalone as the sa3-gen CLI, OR compiled into sa3-server's warm worker as
+// sa3run_gen::run via -DSA3_GEN_AS_LIB (the model headers above are pulled in globally
+// so they stay shared/cached; the worker sets g_sa3_cache_on for resident weights).
+#ifdef SA3_GEN_AS_LIB
+namespace sa3run_gen {
+#endif
 
 // monotonic wall-clock seconds, for the [sa3-timing] phase report (parsed by the ear-test page)
 static double now_s() {
@@ -69,7 +77,11 @@ static int read_wav_planar(const char * path, std::vector<float> & planar) {
     return Nsamp;
 }
 
+#ifdef SA3_GEN_AS_LIB
+int run(int argc, char ** argv) {
+#else
 int main(int argc, char ** argv) {
+#endif
     const char * t5p   = argval(argc, argv, "--t5", "models/sa3-t5gemma-f32.gguf");
     const char * ditp  = argval(argc, argv, "--dit", "models/sa3-dit-f32.gguf");
     const char * samep = argval(argc, argv, "--same", "models/sa3-same-f32.gguf");
@@ -106,9 +118,9 @@ int main(int argc, char ** argv) {
         double in_dur = (double) Nsamp / SR;
         fprintf(stderr, "[sa3-gen] %s: input %.2fs (%d samples)\n", mode_name[mode], in_dur, Nsamp);
         double t_enc_0 = now_s();
-        SA3Enc enc; if (!sa3enc_load(&enc, samep)) return 1;
+        SA3Enc enc; if (!sa3cache_load(&enc, samep, sa3enc_load)) return 1;
         T_in = sa3enc_encode_chunked(&enc, audio.data(), Nsamp, enc_lat);
-        sa3enc_free(&enc);
+        sa3cache_free(&enc, sa3enc_free);
         fprintf(stderr, "[sa3-gen] encoded input -> latent T_in=%d (%.3fs)\n", T_in, now_s()-t_enc_0);
         // a2a/inpaint canvas length == input length; continuation extends to --seconds.
         if (mode != CONTINUE) seconds = (float) in_dur;
@@ -147,13 +159,13 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[sa3-gen] prompt -> %d tokens\n", ntok);
 
     double t_t5_0 = now_s();
-    SA3T5GModel t5; if (!sa3t5g_load(&t5, t5p)) return 1;
+    SA3T5GModel t5; if (!sa3cache_load(&t5, t5p, sa3t5g_load)) return 1;
     double t_t5_load = now_s() - t_t5_0;
     std::vector<float> t5out((size_t)CD*MAXTOK);
     double t_t5_enc_0 = now_s();
     sa3t5g_encode(&t5, ids.data(), valid.data(), MAXTOK, t5out.data());  // [768,256] (tok*768+d)
     double t_t5_enc = now_s() - t_t5_enc_0;
-    sa3t5g_free(&t5);
+    sa3cache_free(&t5, sa3t5g_free);
     double t_t5 = now_s() - t_t5_0;
 
     // ---- assemble cross_cond[768,257] + global[768] ----
@@ -249,7 +261,7 @@ int main(int argc, char ** argv) {
 
     // ---- sampler loop ----
     double t_dit_load_0 = now_s();
-    SA3DiT dit; if (!sa3dit_load(&dit, ditp)) return 1;
+    SA3DiT dit; if (!sa3cache_load(&dit, ditp, sa3dit_load)) return 1;
     double t_dit_load = now_s() - t_dit_load_0;
     std::vector<float> v((size_t)C*L);
     std::mt19937 prng((unsigned)seed+1); std::normal_distribution<float> pnd(0.f,1.f);
@@ -264,7 +276,7 @@ int main(int argc, char ** argv) {
         else { float tn=sig[i+1]; for (size_t k=0;k<x.size();k++){ float den=x[k]-sig[i]*v[k]; x[k]=(1.f-tn)*den + tn*pnd(prng); } }
         fprintf(stderr, "[sa3-gen] step %d/%d (t=%.4f) %.3fs\n", i+1, steps, sig[i], sd);
     }
-    sa3dit_free(&dit);
+    sa3cache_free(&dit, sa3dit_free);
 
     if (cmp[0]) {
         NpyArray el = npy_load((std::string(cmp)+"/euler_latent.npy").c_str());
@@ -275,12 +287,12 @@ int main(int argc, char ** argv) {
 
     // ---- decode + wav ----
     double t_same_0 = now_s();
-    SA3Same same; if (!sa3same_load(&same, samep)) return 1;
+    SA3Same same; if (!sa3cache_load(&same, samep, sa3same_load)) return 1;
     double t_same_load = now_s() - t_same_0;
     double t_same_dec_0 = now_s();
     std::vector<float> audio; int N = sa3same_decode_chunked(&same, x.data(), L, audio);
     double t_same_dec = now_s() - t_same_dec_0;
-    sa3same_free(&same);
+    sa3cache_free(&same, sa3same_free);
     double t_same = now_s() - t_same_0;
     int sr=44100, Nt = (int)(seconds*sr); if (Nt>N) Nt=N;
     std::vector<float> planar(2*(size_t)Nt);
@@ -300,3 +312,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[sa3-timing] total %.3fs  audio %.2fs  RTF %.3f\n", total, audio_s, audio_s > 0 ? total/audio_s : 0.0);
     return 0;
 }
+
+#ifdef SA3_GEN_AS_LIB
+}  // namespace sa3run_gen
+#endif
