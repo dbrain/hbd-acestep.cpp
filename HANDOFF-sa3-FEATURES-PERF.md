@@ -105,5 +105,6 @@ Grounded targets (Q8, flash, RTX 3060):
 
 ## NOT this phase (prod — comes after features+perf)
 sa3-server (async + cancel + warm fork/IPC worker-isolation, mirror songgen-server) · prod Dockerfile ·
-koblem light-GPU gate + UI (open product Q: distinct "game-audio/SFX" engine vs fold into music) ·
-FF-merge sa3-port → acestep.cpp master + bump kobbler ref.
+koblem light-GPU gate + UI · FF-merge sa3-port → acestep.cpp master + bump kobbler ref.
+**Product decision (made):** SA3 folds in **under "music"** beside acestep (NOT a separate engine) — it's a
+selectable model/mode within the existing music surface, sharing the light-GPU gate.
