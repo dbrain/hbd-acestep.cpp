@@ -80,15 +80,12 @@ static void on_signal(int) {
 // ───────────────────────────────────────────────────────────────────────────
 // gguf path resolution (q8 vs q4 = a lelm gguf-path choice)
 // ───────────────────────────────────────────────────────────────────────────
-static std::string lelm_path(const std::string & model) {
-    // LeLM quant selection. Default = Q6_K: the only quant whose generation-stage peak
-    // fits the full 270 s song at <=7.5 GB (measured 2026-06-08: Q6+q8_0KV=7607 MiB vs
-    // Q8=8759 which can't reach 270 s). Q6 cossim-vs-golden 0.995 (PASS). "q8" stays
-    // available for max weight fidelity on shorter songs; "q4" is the small/dirty option.
-    const char * f = (model == "q4") ? "songgen-lelm-large-Q4_K_M.gguf"
-                   : (model == "q8") ? "songgen-lelm-large-Q8_0.gguf"
-                                     : "songgen-lelm-large-Q6_K.gguf";
-    return g_cfg.gguf + "/" + f;
+static std::string lelm_path(const std::string & /*model*/) {
+    // LeLM is always Q6_K — the only quant whose generation-stage VRAM fits the full
+    // 270 s song at <=7.5 GB (measured 2026-06-08: Q6+q8_0KV=7607 MiB vs Q8=8759 which
+    // tops ~141 s). Q6 cossim-vs-golden 0.995 (PASS), ear-A/B vs Q8 indistinguishable.
+    // (model arg retained for call-site compat; q4/q8 selection removed.)
+    return g_cfg.gguf + "/songgen-lelm-large-Q6_K.gguf";
 }
 
 static std::string gguf_path(const char * file) {
