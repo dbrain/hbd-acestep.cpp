@@ -342,9 +342,14 @@ int main(int argc, char ** argv) {
             if (!valid[q][offset]) next[q] = SP;
             if (is_end[q]) next[q] = SP;  // already ended -> special
         }
-        // update is_end (a codebook ends once it samples EOS)
-        for (int q = 0; q < K; q++) {
-            if (!is_end[q] && next[q] == EOS) { is_end[q] = true; eos_step[q] = offset; }
+        // update is_end (a codebook ends once it samples EOS).
+        // SGLM_NO_EOS=1: suppress EOS termination to force generation to the full max_gen_len —
+        // used to measure worst-case (longest-song) KV/VRAM peak, since real content EOSes earlier.
+        static const bool no_eos = getenv("SGLM_NO_EOS") != NULL;
+        if (!no_eos) {
+            for (int q = 0; q < K; q++) {
+                if (!is_end[q] && next[q] == EOS) { is_end[q] = true; eos_step[q] = offset; }
+            }
         }
 
         // write only over unknown (-1) positions

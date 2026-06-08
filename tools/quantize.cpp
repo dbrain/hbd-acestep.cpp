@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -24,6 +26,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "sg-imatrix.h"
 #include "version.h"
 
 // Quant variant: base type + optional bump rules for important tensors
@@ -172,9 +175,9 @@ static bool to_f32(const void * src, float * dst, int64_t n, enum ggml_type type
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
+    if (argc < 4 || argc > 5) {
         fprintf(stderr, "acestep.cpp %s\n\n", ACE_VERSION);
-        fprintf(stderr, "Usage: %s <input.gguf> <output.gguf> <type>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.gguf> <output.gguf> <type> [imatrix.dat]\n", argv[0]);
         fprintf(stderr, "Types:");
         for (const auto & v : VARIANTS) {
             fprintf(stderr, " %s", v.name);
@@ -192,7 +195,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    fprintf(stderr, "[Quantize] %s -> %s (%s)\n", inp_path, out_path, variant->name);
+    // Optional importance matrix (per-channel weights for k-quant rounding).
+    std::map<std::string, std::vector<float>> imatrix;
+    const char *                              imatrix_path = (argc == 5) ? argv[4] : nullptr;
+    if (imatrix_path) {
+        if (!sgim_load(imatrix_path, imatrix)) {
+            fprintf(stderr, "[Quantize] FATAL: failed to load imatrix %s\n", imatrix_path);
+            return 1;
+        }
+        fprintf(stderr, "[Quantize] imatrix: %zu tensors from %s\n", imatrix.size(), imatrix_path);
+    }
+
+    fprintf(stderr, "[Quantize] %s -> %s (%s)%s\n", inp_path, out_path, variant->name,
+            imatrix_path ? " +imatrix" : "");
 
     // Mmap input file
 #ifdef _WIN32
@@ -337,7 +352,7 @@ int main(int argc, char ** argv) {
     }
 
     const size_t alignment   = gguf_get_alignment(out);
-    int          n_quantized = 0, n_promoted = 0;
+    int          n_quantized = 0, n_promoted = 0, n_imatrix = 0;
     int64_t      bytes_in = 0, bytes_out = 0;
     size_t       data_pos = 0;
 
@@ -379,8 +394,17 @@ int main(int argc, char ** argv) {
             const int64_t nrows     = nel / n_per_row;
             const size_t  qsize     = ggml_row_size(plan.target, n_per_row) * (size_t) nrows;
 
+            const float * imp = nullptr;
+            if (!imatrix.empty()) {
+                auto it = imatrix.find(name);
+                if (it != imatrix.end() && (int64_t) it->second.size() == n_per_row) {
+                    imp = it->second.data();
+                    n_imatrix++;
+                }
+            }
+
             std::vector<uint8_t> qbuf(qsize);
-            ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, nullptr);
+            ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, imp);
 
             fwrite(qbuf.data(), 1, qsize, fout);
             data_pos += qsize;
@@ -396,7 +420,11 @@ int main(int argc, char ** argv) {
 
     fclose(fout);
 
-    fprintf(stderr, "[Quantize] Quantized %d/%d tensors, promoted %d to F32\n", n_quantized, n_tensors, n_promoted);
+    fprintf(stderr, "[Quantize] Quantized %d/%d tensors, promoted %d to F32", n_quantized, n_tensors, n_promoted);
+    if (imatrix_path) {
+        fprintf(stderr, ", imatrix applied to %d", n_imatrix);
+    }
+    fprintf(stderr, "\n");
     fprintf(stderr, "[Quantize] %.1f GB -> %.1f GB (%.1fx)\n", (double) bytes_in / 1e9, (double) bytes_out / 1e9,
             bytes_out > 0 ? (double) bytes_in / (double) bytes_out : 0.0);
     fprintf(stderr, "[Quantize] Wrote %s\n", out_path);

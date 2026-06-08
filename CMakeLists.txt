@@ -130,6 +130,10 @@ link_ggml_backends(ace-lm)
 add_executable(songgen-lelm-test tools/songgen-lelm-test.cpp)
 link_ggml_backends(songgen-lelm-test)
 
+# songgen-imatrix: audio-matched importance-matrix collector for the LeLM
+add_executable(songgen-imatrix tools/songgen-imatrix.cpp)
+link_ggml_backends(songgen-imatrix)
+
 # songgen-lelm-gen-test: GATE-1 KV-cache decode vs full-prefill oracle (npy I/O, no core deps)
 add_executable(songgen-lelm-gen-test tools/songgen-lelm-gen-test.cpp)
 link_ggml_backends(songgen-lelm-gen-test)
