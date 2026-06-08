@@ -2,11 +2,13 @@
 //   ./sa3-dit-test <sa3-dit.gguf> <golden_dir> [step]
 // Loads step{N}_xin.npy [1,256,L], step{N}_t.npy, cross_cond.npy [1,257,768], global_cond.npy [1,768];
 // runs DiT; compares to step{N}_vout.npy [1,256,L]. Deterministic (no sampler RNG).
+// If <golden_dir>/local_cond.npy [1,257,L] exists, it is fed to to_local_embed (inpaint path).
 #include "npy.h"
 #include "sa3-dit.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -40,11 +42,28 @@ int main(int argc, char ** argv) {
     std::vector<float> x_t((size_t) C * L);
     for (int c = 0; c < C; c++) for (int l = 0; l < L; l++) x_t[(size_t) l*C + c] = xin.f32[(size_t) c*L + l];
 
+    // optional local_add_cond [1,257,L] channel-major (c*L+l) -> token-major [l*257+c] (inpaint path)
+    std::vector<float> lc_t;
+    const float * lcp = nullptr;
+    {
+        std::string lcf = gp("local_cond.npy");
+        FILE * f = fopen(lcf.c_str(), "rb");
+        if (f) {
+            fclose(f);
+            NpyArray lc = npy_load(lcf.c_str());  // [1,257,L]
+            int LCD = (int) lc.shape[lc.shape.size()-2];
+            lc_t.assign((size_t) LCD * L, 0.0f);
+            for (int c = 0; c < LCD; c++) for (int l = 0; l < L; l++) lc_t[(size_t) l*LCD + c] = lc.f32[(size_t) c*L + l];
+            lcp = lc_t.data();
+            fprintf(stderr, "[golden] local_cond [%d,%d] loaded (inpaint path)\n", LCD, L);
+        }
+    }
+
     SA3DiT m;
     if (!sa3dit_load(&m, gguf.c_str())) { fprintf(stderr, "load failed\n"); return 1; }
 
     std::vector<float> out((size_t) C * L);  // ggml [C,L] token-major (l*C+c)
-    sa3dit_forward(&m, x_t.data(), L, t, cc.f32.data(), cross_T, gcv.f32.data(), out.data());
+    sa3dit_forward(&m, x_t.data(), L, t, cc.f32.data(), cross_T, gcv.f32.data(), out.data(), lcp);
 
     // align golden [C,L] (c*L+l) to compare
     std::vector<float> ours((size_t) C*L), gold((size_t) C*L);

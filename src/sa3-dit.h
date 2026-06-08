@@ -120,8 +120,12 @@ static struct ggml_tensor * sa3_gate(struct ggml_context * c, struct ggml_tensor
 }
 
 // forward. x_lat: [io_channels*L] f32 (ggml [C,L]); cross: [cond_dim*257]; global:[cond_dim]; t scalar.
+// local_cond (optional, inpaint/continuation): [local_cond_dim*L] token-major; per latent position l the
+// 257-vector is [inpaint_mask(1) ; masked_latent(256)] (the reference local_add_cond order). NULL => zeros
+// (t2a / a2a), the original behaviour.
 static void sa3dit_forward(SA3DiT * m, const float * x_lat, int L, float t,
-                           const float * cross_cond, int cross_T, const float * global_cond, float * vel_out) {
+                           const float * cross_cond, int cross_T, const float * global_cond, float * vel_out,
+                           const float * local_cond = nullptr) {
     const SA3DiTConfig & cf = m->cfg;
     int E = cf.embed, D = cf.head_dim, Nh = cf.n_heads, C = cf.io_channels, M = cf.mem_tokens, S = M + L;
 
@@ -192,7 +196,8 @@ static void sa3dit_forward(SA3DiT * m, const float * x_lat, int L, float t,
         cat = ggml_mul_mat(ctx, ly->ca_out, cat);
         x = ggml_add(ctx, res2, cat);
 
-        // local additive cond: to_local_embed(zeros) -> [E,L], pad memory region with zeros
+        // local additive cond: to_local_embed([mask;masked_latent]=257) -> [E,L] (zeros for t2a/a2a),
+        // pad the memory-token region with zeros
         struct ggml_tensor * lc = ggml_add(ctx, ggml_mul_mat(ctx, ly->loc0_w, in_lz), ly->loc0_b);
         lc = ggml_add(ctx, ggml_mul_mat(ctx, ly->loc2_w, sa3_silu(ctx, lc)), ly->loc2_b);  // [E,L]
         struct ggml_tensor * lpad = ggml_concat(ctx, in_mz, lc, 1);        // [E, M+L]
@@ -236,7 +241,9 @@ static void sa3dit_forward(SA3DiT * m, const float * x_lat, int L, float t,
     }
     std::vector<int> pos(S); for (int i = 0; i < S; i++) pos[i] = i;
     float one = 1.0f;
-    std::vector<float> lz((size_t) cf.local_cond_dim * L, 0.0f), mz((size_t) E * M, 0.0f);
+    std::vector<float> lz, mz((size_t) E * M, 0.0f);
+    const float * lzp = local_cond;
+    if (!lzp) { lz.assign((size_t) cf.local_cond_dim * L, 0.0f); lzp = lz.data(); }
 
     ggml_backend_tensor_set(in_x,  x_lat,       0, (size_t) C * L * sizeof(float));
     ggml_backend_tensor_set(in_cc, cross_cond,  0, (size_t) cf.cond_dim * cross_T * sizeof(float));
@@ -244,7 +251,7 @@ static void sa3dit_forward(SA3DiT * m, const float * x_lat, int L, float t,
     ggml_backend_tensor_set(in_ts, ts.data(),   0, ts.size() * sizeof(float));
     ggml_backend_tensor_set(in_pos, pos.data(), 0, pos.size() * sizeof(int));
     ggml_backend_tensor_set(in_one, &one,       0, sizeof(float));
-    ggml_backend_tensor_set(in_lz, lz.data(),   0, lz.size() * sizeof(float));
+    ggml_backend_tensor_set(in_lz, lzp,         0, (size_t) cf.local_cond_dim * L * sizeof(float));
     ggml_backend_tensor_set(in_mz, mz.data(),   0, mz.size() * sizeof(float));
 
     sa3_imx_attach(m->sched);  // no-op unless g_sa3_imx.enabled (imatrix calibration)
