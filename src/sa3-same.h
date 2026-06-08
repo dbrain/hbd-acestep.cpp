@@ -190,6 +190,9 @@ static int sa3same_decode(SA3Same * m, const float * z_t, int T, std::vector<flo
 // reference chunked_decode. z_t [C,T] token-major. Returns total samples; audio_out [2,N] planar.
 static int sa3same_decode_chunked(SA3Same * m, const float * z_t, int T, std::vector<float> & audio_out,
                                   int chunk = 128, int overlap = 32) {
+    // SA3_SAME_CHUNK / SA3_SAME_OVERLAP override the defaults (chunk-size sweep / tuning).
+    if (const char * e = getenv("SA3_SAME_CHUNK"))   { int v = atoi(e); if (v > 0) chunk = v; }
+    if (const char * e = getenv("SA3_SAME_OVERLAP")) { int v = atoi(e); if (v >= 0) overlap = v; }
     const int C = m->cfg.latent_dim, P = m->cfg.patch * m->cfg.stride;  // samples per latent frame = 4096
     if (T <= chunk) return sa3same_decode(m, z_t, T, audio_out);
     int Ntot = T * P;

@@ -1,5 +1,49 @@
 # SA3 port — HANDOFF: feature-complete + perf-tune (then prod)
 
+> **STATUS UPDATE 2026-06-08 — Phase 2 DONE + pushed (`sa3-port` @ `ee13c9c`); Phase 3 characterised.**
+> ### Phase 2 (feature-complete) — SHIPPED & validated
+> - **SAME encoder** `src/sa3-same-enc.h` — mirror of the decoder (patch[512]→weightnorm conv 512→1536→
+>   12 SiLU diff-attn blocks, banded |i−j|≤17 + partial RoPE→keep-LAST-of-each-17-group→proj 1536→256→
+>   **softnorm encode** `(x*scaling_factor + bias)/running_std`). Weights were already in the same gguf
+>   (`enc.*`, `bn.scale/bias/running_std`). Golden `sa3-same-enc-test`: **0.999938 CPU / 0.999024 GPU**
+>   (flash F16 drifts it to the 0.999 line — passes). Golden gen: `.sa3ref/gen_enc_golden.py` (encodes
+>   the decoded `audio.npy` → `enc_latent.npy`). Chunked variant `sa3enc_encode_chunked`.
+> - **a2a (SDEdit)** in `sa3-gen`: `--input wav --strength`. encode→`x = init*(1−σ)+noise*σ` (σ=strength),
+>   schedule `sigmoid(t*8.2−2)` over `linspace(σ,0)` with `sig[0]=σ` (reference `build_schedule` forces it).
+> - **inpaint + continuation**: the DiT `to_local_embed` now takes a **real** `[inpaint_mask(1) ;
+>   masked_latent(256)] = 257` (was zeros). **KEY FINDING:** SA3 inpaint is **conditioning-based, NOT
+>   sampler x-pinning** — the reference euler/pingpong samplers do zero masking of `x`; `to_local_embed`
+>   alone carries the known region. (Handoff's "pin each step" was a misconception.) `sa3dit_forward`
+>   gained an optional `local_cond` arg (NULL=zeros ⇒ unchanged t2a, re-validated 0.999866). CLI:
+>   `--mask "s0:e0,s1:e1"` (seconds, regenerate those) / `--continue` (keep input prefix, extend to
+>   `--seconds`). DiT local-cond golden `sa3-dit-test` (auto-loads `<dir>/local_cond.npy`):
+>   **1.000000 CPU / 0.999999 GPU** (`.sa3ref/gen_inpaint_golden.py`; reuses step-0 inputs so only the
+>   257-feed differs — isolates the new wiring). Ear: continuation prefix **0.9986** vs input, inpaint
+>   kept **0.9961** / regenerated region **0.156** (genuinely new) — exactly right.
+> - Build set updated: `kobbler/docker/acestep-sa3-dev/iter.sh` `SA3_TARGETS` += `sa3-same-enc-test`
+>   (uncommitted kobbler change). CPU oracle build: `./buildcpu.sh` configures **`-DGGML_BLAS=OFF`**
+>   (host lacks cblas — BLAS=ON link-fails on `cblas_sgemm`).
+>
+> ### Phase 3 (perf) — characterised; surface largely exhausted (matches the pre-Phase-2 conclusion)
+> - **SAME-decode chunk sweep** (30s, L=388, env knob `SA3_SAME_CHUNK`/`SA3_SAME_OVERLAP` added to
+>   `sa3same_decode_chunked`): dec-time 96→1.12s, **128→1.02s (best)**, 192→1.05s, 256→1.36s, full→1.19s.
+>   **chunk=128 is already the sweet spot** (bigger loses to N² band-attn growth, smaller to overlap
+>   waste). No free win.
+> - **Steps 6-vs-8** (12s, euler): DiT 8→1.09s / 6→0.82s (**−24% DiT**) / 4→0.56s (−49%). Audio cosine
+>   vs 8: **6→0.945**, 4→0.876. DiT is ~33% of wall here ⇒ steps=6 ≈ −9% total (bigger at longer L,
+>   DiT scales L²). 6 is a **plausible** default — **JUDGE BY EAR** (rendered `out/steps_{8,6,4}.wav`;
+>   or `./eartest.sh 8103 "s8:--steps 8" "s6:--steps 6" "s4:--steps 4"`). 4 likely too lossy.
+> - **nsys (30s, flash, Q8)**: `mul_mat_q` 31.2% (Q8 weight floor) · `flash_attn_ext` 15.5% ·
+>   `k_bin_bcast add` 7.9% · **`cpy_perm` 7.3% + `cpy_scalar` 4.4% = 11.7%** (head-permute + K/V F16
+>   cast). The K/V-F16-prestore lever targets only the **~4.4%** cast (cpy_perm is the inherent layout
+>   permute); mechanical, deferred, needs clean (un-shared) GPU runs to confirm — perf numbers above were
+>   taken sharing the GPU with a small TTS job, so treat as directional.
+>
+> **NEXT = Phase 4 (prod):** sa3-server (async+cancel+warm fork/IPC isolation, mirror songgen) · Dockerfile
+> · koblem **under "music"** beside acestep (selectable model/mode, shared light-GPU gate) · FF-merge
+> `sa3-port` → master + bump kobbler ref. SA3 model surface is now complete (t2a/a2a/inpaint/continuation).
+
+
 Fresh-context handoff. The text-to-audio (T2A) port is **DONE, validated on GPU, committed + pushed**
 (`origin/sa3-port` @ `79d2aaa` on `dbrain/hbd-acestep.cpp`; kobbler dev harness @ `35d83688`).
 This phase = **feature-complete the model surface, then performance-tune**. Prod (server / docker /
