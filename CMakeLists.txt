@@ -199,6 +199,33 @@ link_ggml_backends(songgen-clone)
 add_executable(songgen-continue tools/songgen-continue.cpp)
 link_ggml_backends(songgen-continue)
 
+# ---- Stable Audio 3 (sa3-*) port: header-only golden harnesses (npy I/O, no core deps) ----
+add_executable(sa3-t5gemma-test tools/sa3-t5gemma-test.cpp)
+link_ggml_backends(sa3-t5gemma-test)
+add_executable(sa3-dit-test tools/sa3-dit-test.cpp)
+link_ggml_backends(sa3-dit-test)
+add_executable(sa3-same-test tools/sa3-same-test.cpp)
+link_ggml_backends(sa3-same-test)
+add_executable(sa3-same-enc-test tools/sa3-same-enc-test.cpp)
+link_ggml_backends(sa3-same-enc-test)
+add_executable(sa3-pipeline-test tools/sa3-pipeline-test.cpp)
+link_ggml_backends(sa3-pipeline-test)
+add_executable(sa3-tok-test tools/sa3-tok-test.cpp)
+link_ggml_backends(sa3-tok-test)
+add_executable(sa3-gen tools/sa3-gen.cpp)
+link_ggml_backends(sa3-gen)
+add_executable(sa3-imatrix-collect tools/sa3-imatrix-collect.cpp)
+link_ggml_backends(sa3-imatrix-collect)
+
+# sa3-server: HTTP API for the Stable Audio 3 port (async + cancel + warm fork/IPC
+# worker isolation). Compiles sa3-gen's pipeline in-process (#define SA3_GEN_AS_LIB ->
+# sa3run_gen::run) for a warm resident-model worker, so it links ggml + the src/ headers
+# like the other sa3 tools, plus httplib + yyjson for the HTTP/JSON surface.
+add_executable(sa3-server tools/sa3-server.cpp)
+target_include_directories(sa3-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(sa3-server PRIVATE httplib yyjson)
+link_ggml_backends(sa3-server)
+
 # webui: convert tools/webui/public/index.html.gz to a C header for embedding.
 # the .gz is committed to git so the C++ build works without npm.
 # to update: cd tools/webui && npm install && npm run build, then rebuild ace-server.

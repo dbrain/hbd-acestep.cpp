@@ -29,6 +29,14 @@
 #include "sg-imatrix.h"
 #include "version.h"
 
+#include <map>
+#include <string>
+
+// Imatrix loading uses sgim_load (sg-imatrix.h) — the songgen importance-matrix
+// path. SA3 quantizes flat (imatrix was characterised non-beneficial for its DiT),
+// so it simply omits the optional 4th arg; its only quantize change is keeping the
+// conditioner/prepended-token tensors F32 (see below).
+
 // Quant variant: base type + optional bump rules for important tensors
 struct QuantVariant {
     const char *   name;
@@ -101,6 +109,11 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
         return false;
     }
     if (strstr(name, "scale_shift_table")) {
+        return false;
+    }
+    // SA3: keep tiny conditioner + prepended-token tensors F32 (read on CPU / concatenated, not matmul weights).
+    if (strstr(name, "sec.emb") || strstr(name, "pad_embed") ||
+        strstr(name, "mem_tokens") || strstr(name, "new_tokens")) {
         return false;
     }
     if (strstr(name, "null_condition_emb")) {
