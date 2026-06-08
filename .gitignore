@@ -1,14 +1,17 @@
-build/
-*.wav
-*.bf16
 
-tests/*/
-
-checkpoints/
-models/*.gguf
 adapters/*/
 adapters/*.safetensors
-__pycache__/
-node_modules/
-tools/webui/dist/
+*.bf16
+build/
 build-vulkan/
+build-cuda/
+build-cpu/
+checkpoints/
+models/*.gguf
+models/*.imatrix
+node_modules/
+__pycache__/
+.sa3ref/
+tests/*/
+tools/webui/dist/
+*.wav

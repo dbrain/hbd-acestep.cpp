@@ -26,6 +26,28 @@
 #include "gguf.h"
 #include "version.h"
 
+#include <map>
+#include <string>
+
+// Minimal imatrix loader (format from sa3-imatrix.h): [u32 n] then [u32 len,name,u32 ne0,f32[ne0]]*
+static std::map<std::string, std::vector<float>> load_imatrix(const char * path) {
+    std::map<std::string, std::vector<float>> out;
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[Quantize] imatrix %s not found\n", path); return out; }
+    uint32_t n = 0; if (fread(&n, 4, 1, f) != 1) { fclose(f); return out; }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t len = 0, ne0 = 0;
+        if (fread(&len, 4, 1, f) != 1) break;
+        std::string name(len, '\0'); if (fread(&name[0], 1, len, f) != len) break;
+        if (fread(&ne0, 4, 1, f) != 1) break;
+        std::vector<float> v(ne0); if (fread(v.data(), 4, ne0, f) != ne0) break;
+        out[name] = std::move(v);
+    }
+    fclose(f);
+    fprintf(stderr, "[Quantize] loaded imatrix: %zu tensors\n", out.size());
+    return out;
+}
+
 // Quant variant: base type + optional bump rules for important tensors
 struct QuantVariant {
     const char *   name;
@@ -100,6 +122,11 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
     if (strstr(name, "scale_shift_table")) {
         return false;
     }
+    // SA3: keep tiny conditioner + prepended-token tensors F32 (read on CPU / concatenated, not matmul weights).
+    if (strstr(name, "sec.emb") || strstr(name, "pad_embed") ||
+        strstr(name, "mem_tokens") || strstr(name, "new_tokens")) {
+        return false;
+    }
     if (strstr(name, "null_condition_emb")) {
         return false;
     }
@@ -172,9 +199,9 @@ static bool to_f32(const void * src, float * dst, int64_t n, enum ggml_type type
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
+    if (argc < 4 || argc > 5) {
         fprintf(stderr, "acestep.cpp %s\n\n", ACE_VERSION);
-        fprintf(stderr, "Usage: %s <input.gguf> <output.gguf> <type>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input.gguf> <output.gguf> <type> [imatrix]\n", argv[0]);
         fprintf(stderr, "Types:");
         for (const auto & v : VARIANTS) {
             fprintf(stderr, " %s", v.name);
@@ -191,6 +218,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[Quantize] Unknown type: %s\n", argv[3]);
         return 1;
     }
+
+    std::map<std::string, std::vector<float>> imatrix;
+    if (argc == 5) imatrix = load_imatrix(argv[4]);
 
     fprintf(stderr, "[Quantize] %s -> %s (%s)\n", inp_path, out_path, variant->name);
 
@@ -380,7 +410,10 @@ int main(int argc, char ** argv) {
             const size_t  qsize     = ggml_row_size(plan.target, n_per_row) * (size_t) nrows;
 
             std::vector<uint8_t> qbuf(qsize);
-            ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, nullptr);
+            const float * imx = nullptr;
+            auto it = imatrix.find(name);
+            if (it != imatrix.end() && (int64_t) it->second.size() == n_per_row) imx = it->second.data();
+            ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, imx);
 
             fwrite(qbuf.data(), 1, qsize, fout);
             data_pos += qsize;
