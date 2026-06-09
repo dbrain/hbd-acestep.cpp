@@ -83,8 +83,8 @@ int main(int argc, char ** argv) {
 #endif
     std::string lyric, description, vocal_path, bgm_path, full_path, gen_type_s = "mixed";
     bool        have_lyric = false, have_desc = false;
-    float       duration_sec = -1.0f, arg_temp = 1.0f, arg_cfg = 1.5f, arg_fade = 200.0f;
-    int         frames_arg = -1, arg_topk = 250;
+    float       duration_sec = -1.0f, arg_temp = 0.9f, arg_cfg = 1.5f, arg_fade = 200.0f;  // LeVo reference sampling (was 1.0)
+    int         frames_arg = -1, arg_topk = 50;                                            // LeVo reference top_k (was 250)
     std::vector<char *> pos;
     for (int i = 0; i < argc; i++) {
         std::string a = i > 0 ? argv[i] : "";
@@ -214,7 +214,7 @@ int main(int argc, char ** argv) {
     SgGenParams P;
     if (frames_arg > 0)           P.max_gen_len = frames_arg;
     else if (duration_sec > 0.0f) P.max_gen_len = (int) lroundf(duration_sec * 25.0f);
-    else                          P.max_gen_len = 375;
+    else                          P.max_gen_len = SGGEN_MODEL_MAX_FRAMES;  // 270 s ceiling, EOS-terminated (was 375=15s)
     if (P.max_gen_len < 1) P.max_gen_len = 1;
     P.top_k    = arg_topk;
     P.temp     = arg_temp;

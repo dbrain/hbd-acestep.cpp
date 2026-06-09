@@ -869,10 +869,20 @@ static void run_stem_job(const httplib::Request & req, httplib::Response & res, 
 
     std::string model    = form_str(req, "model", "q8");
     std::string gen_type = form_str(req, "gen_type", "mixed");
-    double      duration = atof(form_str(req, "duration", "15").c_str());
-    double      seed     = atof(form_str(req, "seed", "1234").c_str());
+    // duration is OPTIONAL: when omitted, pass no --duration so the CLI runs to the
+    // model max (270 s) and stops on EOS — lyric-driven length, matching /generate.
+    // An explicit duration acts as a hard cap (truncate). (Was: hard-default 15 s.)
+    bool        has_duration = form_has(req, "duration");
+    double      duration     = atof(form_str(req, "duration", "0").c_str());
+    double      seed         = atof(form_str(req, "seed", "1234").c_str());
     if (model != "q8" && model != "q4") model = "q8";
-    if (duration <= 0.0 || duration > (double) g_cfg.max_duration) duration = 15.0;
+    if (has_duration && (duration <= 0.0 || duration > (double) g_cfg.max_duration)) {
+        if (!vocal.empty()) unlink(vocal.c_str());
+        if (!bgm.empty())   unlink(bgm.c_str());
+        if (!mix.empty())   unlink(mix.c_str());
+        json_error(res, 400, "duration out of range");
+        return;
+    }
 
     std::string out_wav = unique_out_path();
     const char * exe    = is_continue ? "/songgen-continue" : "/songgen-clone";
@@ -895,15 +905,17 @@ static void run_stem_job(const httplib::Request & req, httplib::Response & res, 
     if (!mix.empty()) { args.push_back("--full-mix"); args.push_back(mix); }
     args.push_back("--lyric");      args.push_back(lyric);
     if (form_has(req, "description")) { args.push_back("--description"); args.push_back(form_str(req, "description", "")); }
-    args.push_back("--duration");   args.push_back(std::to_string(duration));
+    if (has_duration) { args.push_back("--duration"); args.push_back(std::to_string(duration)); }
     args.push_back("--gen-type");   args.push_back(gen_type);
     if (form_has(req, "temp"))  { args.push_back("--temp");  args.push_back(form_str(req, "temp", "1.0")); }
     if (form_has(req, "top_k")) { args.push_back("--top-k"); args.push_back(form_str(req, "top_k", "250")); }
     if (form_has(req, "cfg"))   { args.push_back("--cfg");   args.push_back(form_str(req, "cfg", "1.5")); }
     if (form_has(req, "fade"))  { args.push_back("--fade");  args.push_back(form_str(req, "fade", "200")); }
 
-    fprintf(stderr, "[songgen-server] /%s model=%s dur=%.1fs seed=%llu type=%s\n",
-            is_continue ? "continue" : "clone", model.c_str(), duration, (unsigned long long) seed, gen_type.c_str());
+    fprintf(stderr, "[songgen-server] /%s model=%s dur=%s seed=%llu type=%s\n",
+            is_continue ? "continue" : "clone", model.c_str(),
+            has_duration ? (std::to_string(duration) + "s").c_str() : "EOS",
+            (unsigned long long) seed, gen_type.c_str());
 
     std::vector<std::string> cleanup = { vocal, bgm };
     if (!mix.empty()) {

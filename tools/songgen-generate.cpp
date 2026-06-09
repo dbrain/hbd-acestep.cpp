@@ -59,8 +59,8 @@ int main(int argc, char ** argv) {
     bool        have_lyric = false, have_desc = false;
     float       duration_sec = -1.0f;  // <0 -> use frames / default
     int         frames_arg   = -1;
-    float       arg_temp = 1.0f, arg_cfg = 1.5f, arg_fade = 200.0f;
-    int         arg_topk = 250;
+    float       arg_temp = 0.9f, arg_cfg = 1.5f, arg_fade = 200.0f;  // LeVo reference sampling (was 1.0)
+    int         arg_topk = 50;                                       // LeVo reference top_k (was 250 = far too loose)
     {
         std::vector<char *> pos;
         for (int i = 0; i < argc; i++) {
