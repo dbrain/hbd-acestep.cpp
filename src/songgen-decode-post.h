@@ -21,11 +21,11 @@ enum SgGenType { SG_MIXED = 0, SG_VOCAL = 1, SG_BGM = 2 };
 
 struct SgGenParams {
     int       max_gen_len = 375;    // frames; round(duration*25)
-    int       top_k       = 250;    // cb0 only
-    float     temp        = 1.0f;
-    float     cfg_coef    = 1.5f;
-    float     rep_penalty = 1.1f;
-    int       record_win  = 150;
+    int       top_k       = 5000;   // cb0 only (LeVo full-mem generate(); overridden by --top-k)
+    float     temp        = 0.8f;   // LeVo full-mem generate() (overridden by --temp)
+    float     cfg_coef    = 1.5f;   // LeVo inference_coef (config.yaml)
+    float     rep_penalty = 1.1f;   // LeVo logits /= 1.1**count over record_win (lm_levo.py)
+    int       record_win  = 50;     // LeVo record_window=50 (was 150); NOT CLI-overridable, so this is the effective value
     float     fade_ms     = 200.0f; // fade-out length; fade-in is min(10ms, fade_ms)
     SgGenType gen_type    = SG_MIXED;
     // chunked decode: enabled when max_gen_len > chunk_frames. Frame = 40ms (25 fps).

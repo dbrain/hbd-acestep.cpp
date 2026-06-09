@@ -83,8 +83,8 @@ int main(int argc, char ** argv) {
 #endif
     std::string lyric, description, vocal_path, bgm_path, full_path, gen_type_s = "mixed";
     bool        have_lyric = false, have_desc = false;
-    float       duration_sec = -1.0f, arg_temp = 0.9f, arg_cfg = 1.5f, arg_fade = 200.0f;  // LeVo reference sampling (was 1.0)
-    int         frames_arg = -1, arg_topk = 50;                                            // LeVo reference top_k (was 250)
+    float       duration_sec = -1.0f, arg_temp = 0.8f, arg_cfg = 1.5f, arg_fade = 200.0f;  // LeVo full-mem preset (same sampling as generate; reference uses one config for all task types)
+    int         frames_arg = -1, arg_topk = 5000;                                          // LeVo full-mem top_k (cb0 only; lowmem/paper = 50)
     std::vector<char *> pos;
     for (int i = 0; i < argc; i++) {
         std::string a = i > 0 ? argv[i] : "";
