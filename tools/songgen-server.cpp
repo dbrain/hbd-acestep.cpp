@@ -407,9 +407,9 @@ static std::string unique_out_path() {
 //   duration     number  (optional, default 15) seconds
 //   seed         number  (optional, default 1234)
 //   gen_type     string  (optional, "mixed"|"vocal"|"bgm", default "mixed")
-//   temp         number  (optional, default 1.0)
-//   top_k        number  (optional, default 250)
-//   cfg          number  (optional, default 1.5)
+//   temp         number  (optional; omitted -> songgen-generate default 0.8)
+//   top_k        number  (optional; omitted -> songgen-generate default 50)
+//   cfg          number  (optional; omitted -> songgen-generate default 1.8)
 //   fade         number  (optional ms, default 200)
 //   model        string  (optional, "q8"|"q4", default "q8")
 // returns: audio/wav (the generated song), or JSON error.

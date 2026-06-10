@@ -59,8 +59,11 @@ int main(int argc, char ** argv) {
     bool        have_lyric = false, have_desc = false;
     float       duration_sec = -1.0f;  // <0 -> use frames / default
     int         frames_arg   = -1;
-    float       arg_temp = 0.8f, arg_cfg = 1.5f, arg_fade = 200.0f;  // LeVo generate() full-mem preset (generate.py:229-237)
-    int         arg_topk = 5000;                                     // LeVo full-mem top_k (cb0 only; lowmem/paper = 50). host-side, no VRAM cost
+    // Sampling/fade defaults live ONLY in SgGenParams (songgen-decode-post.h);
+    // seed the CLI locals from it so there is exactly one copy of each number.
+    const SgGenParams sgdef;
+    float       arg_temp = sgdef.temp, arg_cfg = sgdef.cfg_coef, arg_fade = sgdef.fade_ms;
+    int         arg_topk = sgdef.top_k;
     {
         std::vector<char *> pos;
         for (int i = 0; i < argc; i++) {

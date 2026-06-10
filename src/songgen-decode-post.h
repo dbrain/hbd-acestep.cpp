@@ -19,11 +19,16 @@
 
 enum SgGenType { SG_MIXED = 0, SG_VOCAL = 1, SG_BGM = 2 };
 
+// Canonical generation defaults — the SINGLE source of truth. The CLI tools
+// (generate/clone/continue) seed their arg parsing from a default-constructed
+// SgGenParams, so changing a value here changes it everywhere. Sampling matches
+// the tuned tencent/SongGeneration HF demo preset (top_k 50 / cfg 1.8 / temp 0.8);
+// LeVo's full-mem generate() reference instead uses top_k 5000 / cfg 1.5.
 struct SgGenParams {
     int       max_gen_len = 375;    // frames; round(duration*25)
-    int       top_k       = 5000;   // cb0 only (LeVo full-mem generate(); overridden by --top-k)
-    float     temp        = 0.8f;   // LeVo full-mem generate() (overridden by --temp)
-    float     cfg_coef    = 1.5f;   // LeVo inference_coef (config.yaml)
+    int       top_k       = 50;     // cb0 only; HF demo preset (LeVo full-mem generate() = 5000). overridden by --top-k
+    float     temp        = 0.8f;   // HF demo / LeVo generate() (overridden by --temp)
+    float     cfg_coef    = 1.8f;   // tencent/SongGeneration HF demo (LeVo config.yaml inference_coef = 1.5)
     float     rep_penalty = 1.1f;   // LeVo logits /= 1.1**count over record_win (lm_levo.py)
     int       record_win  = 50;     // LeVo record_window=50 (was 150); NOT CLI-overridable, so this is the effective value
     float     fade_ms     = 200.0f; // fade-out length; fade-in is min(10ms, fade_ms)
