@@ -517,14 +517,19 @@ static pid_t                  g_wk_pid  = -1;
 static int                    g_wk_data = -1;
 static std::atomic<bool>      g_wk_busy{ false };
 static std::atomic<long long> g_wk_last_activity{ 0 };
+// GPU placement (multi-GPU scheduler).
+static std::string            g_default_gpu;   // from WORKER_DEFAULT_GPU env
+static std::string            g_next_gpu;      // pending per-request target (g_wk_mtx)
+static std::string            g_wk_gpu;        // GPU the live worker is on (g_wk_mtx)
 
-static pid_t worker_spawn(int * out_data) {
+static pid_t worker_spawn(int * out_data, const std::string & gpu) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     pid_t pid = ::fork();
     if (pid < 0) { ::close(sv[0]); ::close(sv[1]); return -1; }
     if (pid == 0) {
         ::close(sv[0]);
+        if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         char dbuf[16];
         std::snprintf(dbuf, sizeof(dbuf), "%d", sv[1]);
         char wflag[] = "--worker";
@@ -554,9 +559,14 @@ static void kill_worker_locked() {  // caller holds g_wk_mtx
 }
 
 static bool ensure_worker_locked() {  // caller holds g_wk_mtx
-    if (g_wk_pid > 0) return true;
+    const std::string want_gpu = g_next_gpu.empty() ? g_default_gpu : g_next_gpu;
+    if (g_wk_pid > 0 && g_wk_gpu == want_gpu) return true;
+    if (g_wk_pid > 0) {
+        fprintf(stderr, "[songgen-server] relocating worker '%s' -> '%s'\n", g_wk_gpu.c_str(), want_gpu.c_str());
+        kill_worker_locked();
+    }
     int   d   = -1;
-    pid_t pid = worker_spawn(&d);
+    pid_t pid = worker_spawn(&d, want_gpu);
     if (pid < 0) { fprintf(stderr, "[songgen-server] worker spawn failed\n"); return false; }
     WHdr        h{};
     std::string pl;
@@ -570,7 +580,8 @@ static bool ensure_worker_locked() {  // caller holds g_wk_mtx
     }
     g_wk_pid  = pid;
     g_wk_data = d;
-    fprintf(stderr, "[songgen-server] worker pid=%d spawned (isolation)\n", (int) pid);
+    g_wk_gpu  = want_gpu;
+    fprintf(stderr, "[songgen-server] worker pid=%d spawned (isolation) gpu='%s'\n", (int) pid, want_gpu.c_str());
     return true;
 }
 
@@ -704,6 +715,8 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
         return;
     }
 
+    { std::string g = json_get_str(root, "gpu", "");  // gate placement target
+      if (!g.empty()) { std::lock_guard<std::mutex> lk(g_wk_mtx); g_next_gpu = g; } }
     std::string lyric       = json_get_str(root, "lyric", "");
     std::string description = json_get_str(root, "description", "");
     if (lyric.empty() || description.empty()) {
@@ -1105,6 +1118,7 @@ int main(int argc, char ** argv) {
     g_argc       = argc;
     g_argv       = argv;
     if (const char * e = getenv("SG_WORKER_ISOLATION")) g_isolation = atoi(e) != 0;
+    if (const char * e = getenv("WORKER_DEFAULT_GPU")) { g_default_gpu = e; fprintf(stderr, "[songgen-server] default GPU = %s\n", e); }
     if (const char * e = getenv("SG_IDLE_UNLOAD_SEC")) g_idle_unload_seconds = atoi(e);
 
     for (int i = 1; i < argc; i++) {

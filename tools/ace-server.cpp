@@ -973,10 +973,26 @@ static void synth_worker(std::shared_ptr<Job>    job,
 //   fed back to /vae decode.
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
+static void ace_set_next_gpu(const std::string & g);  // defined w/ the worker globals below
+
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
     if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
         json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
         return;
+    }
+
+    // Per-request GPU target (gate placement): parse `gpu` from the JSON body
+    // (the parent-side globals live further down, so route via the setter).
+    if (!req.body.empty()) {
+        yyjson_doc * gd = yyjson_read(req.body.c_str(), req.body.size(), 0);
+        if (gd) {
+            yyjson_val * gr = yyjson_doc_get_root(gd);
+            if (gr && yyjson_is_obj(gr)) {
+                yyjson_val * gv = yyjson_obj_get(gr, "gpu");
+                if (gv && yyjson_is_str(gv)) ace_set_next_gpu(yyjson_get_str(gv));
+            }
+            yyjson_doc_free(gd);
+        }
     }
 
     // parse request: plain JSON (single or array) or multipart (JSON + audio file or src_latents).
@@ -2029,6 +2045,13 @@ static int                    g_wk_data = -1;
 static int                    g_wk_ctrl = -1;
 static std::atomic<bool>      g_wk_busy{ false };       // a RUN is in flight (don't idle-kill)
 static std::atomic<long long> g_wk_last_activity{ 0 };
+// GPU placement (multi-GPU scheduler).
+static std::string            g_default_gpu;   // from WORKER_DEFAULT_GPU env
+static std::string            g_next_gpu;      // pending per-request target (g_wk_mtx)
+static std::string            g_wk_gpu;        // GPU the live worker is on (g_wk_mtx)
+static void ace_set_next_gpu(const std::string & g) {  // fwd-declared above handle_synth
+    if (!g.empty()) { std::lock_guard<std::mutex> lk(g_wk_mtx); g_next_gpu = g; }
+}
 
 static void worker_touch() {
     g_wk_last_activity.store(now_ms());
@@ -2036,7 +2059,7 @@ static void worker_touch() {
 
 // fork + execv self with the original argv plus `--worker <datafd> --control <ctrlfd>`.
 // Returns child pid; sets *out_data/*out_ctrl to the parent ends. -1 on failure.
-static pid_t worker_spawn(int * out_data, int * out_ctrl) {
+static pid_t worker_spawn(int * out_data, int * out_ctrl, const std::string & gpu) {
     int dv[2], cv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, dv) != 0) {
         return -1;
@@ -2057,6 +2080,7 @@ static pid_t worker_spawn(int * out_data, int * out_ctrl) {
     if (pid == 0) {
         ::close(dv[0]);
         ::close(cv[0]);
+        if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         char dbuf[16], cbuf[16];
         std::snprintf(dbuf, sizeof(dbuf), "%d", dv[1]);
         std::snprintf(cbuf, sizeof(cbuf), "%d", cv[1]);
@@ -2110,11 +2134,16 @@ static void kill_worker_locked() {
 
 // caller holds g_wk_mtx. Ensures a live, ready worker. Returns false on failure.
 static bool ensure_worker_locked() {
-    if (g_wk_pid > 0) {
+    const std::string want_gpu = g_next_gpu.empty() ? g_default_gpu : g_next_gpu;
+    if (g_wk_pid > 0 && g_wk_gpu == want_gpu) {
         return true;
     }
+    if (g_wk_pid > 0) {
+        fprintf(stderr, "[Server] relocating worker '%s' -> '%s'\n", g_wk_gpu.c_str(), want_gpu.c_str());
+        kill_worker_locked();
+    }
     int   d = -1, c = -1;
-    pid_t pid = worker_spawn(&d, &c);
+    pid_t pid = worker_spawn(&d, &c, want_gpu);
     if (pid < 0) {
         fprintf(stderr, "[Server] failed to spawn worker\n");
         return false;
@@ -2133,7 +2162,8 @@ static bool ensure_worker_locked() {
     g_wk_pid  = pid;
     g_wk_data = d;
     g_wk_ctrl = c;
-    fprintf(stderr, "[Server] worker pid=%d spawned (isolation)\n", (int) pid);
+    g_wk_gpu  = want_gpu;
+    fprintf(stderr, "[Server] worker pid=%d spawned (isolation) gpu='%s'\n", (int) pid, want_gpu.c_str());
     return true;
 }
 

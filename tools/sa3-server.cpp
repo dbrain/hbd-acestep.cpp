@@ -431,14 +431,21 @@ static pid_t                  g_wk_pid  = -1;
 static int                    g_wk_data = -1;
 static std::atomic<bool>      g_wk_busy{ false };
 static std::atomic<long long> g_wk_last_activity{ 0 };
+// GPU placement (multi-GPU scheduler): default card (UUID) for un-targeted
+// requests, pending per-request target, and the GPU the warm worker is on.
+static std::string            g_default_gpu;   // from WORKER_DEFAULT_GPU env
+static std::string            g_next_gpu;      // pending per-request override (g_wk_mtx)
+static std::string            g_wk_gpu;        // GPU the live worker is pinned to (g_wk_mtx)
 
-static pid_t worker_spawn(int * out_data) {
+static pid_t worker_spawn(int * out_data, const std::string & gpu) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     pid_t pid = ::fork();
     if (pid < 0) { ::close(sv[0]); ::close(sv[1]); return -1; }
     if (pid == 0) {
         ::close(sv[0]);
+        // Pin this worker to a specific GPU before execv (parent is CUDA-free).
+        if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         char dbuf[16];
         std::snprintf(dbuf, sizeof(dbuf), "%d", sv[1]);
         char                wflag[] = "--worker";
@@ -468,9 +475,14 @@ static void kill_worker_locked() {  // caller holds g_wk_mtx
 }
 
 static bool ensure_worker_locked() {  // caller holds g_wk_mtx
-    if (g_wk_pid > 0) return true;
+    const std::string want_gpu = g_next_gpu.empty() ? g_default_gpu : g_next_gpu;
+    if (g_wk_pid > 0 && g_wk_gpu == want_gpu) return true;
+    if (g_wk_pid > 0) {  // alive but wrong card → relocate
+        fprintf(stderr, "[sa3-server] relocating worker '%s' -> '%s'\n", g_wk_gpu.c_str(), want_gpu.c_str());
+        kill_worker_locked();
+    }
     int   d   = -1;
-    pid_t pid = worker_spawn(&d);
+    pid_t pid = worker_spawn(&d, want_gpu);
     if (pid < 0) { fprintf(stderr, "[sa3-server] worker spawn failed\n"); return false; }
     WHdr        h{};
     std::string pl;
@@ -484,7 +496,8 @@ static bool ensure_worker_locked() {  // caller holds g_wk_mtx
     }
     g_wk_pid  = pid;
     g_wk_data = d;
-    fprintf(stderr, "[sa3-server] worker pid=%d spawned (isolation)\n", (int) pid);
+    g_wk_gpu  = want_gpu;
+    fprintf(stderr, "[sa3-server] worker pid=%d spawned (isolation) gpu='%s'\n", (int) pid, want_gpu.c_str());
     return true;
 }
 
@@ -636,6 +649,9 @@ static void handle_generate(const httplib::Request & req, httplib::Response & re
         json_error(res, 400, "Body must be a JSON object");
         return;
     }
+    // Per-request GPU target (gate placement); next ensure_worker relocates.
+    { std::string g = json_get_str(root, "gpu", "");
+      if (!g.empty()) { std::lock_guard<std::mutex> lk(g_wk_mtx); g_next_gpu = g; } }
     std::string prompt = json_get_str(root, "prompt", "");
     if (prompt.empty()) {
         yyjson_doc_free(doc);
@@ -908,6 +924,7 @@ int main(int argc, char ** argv) {
     g_argv       = argv;
     if (const char * e = getenv("SA3_WORKER_ISOLATION")) g_isolation = atoi(e) != 0;
     if (const char * e = getenv("SA3_IDLE_UNLOAD_SEC")) g_idle_unload_seconds = atoi(e);
+    if (const char * e = getenv("WORKER_DEFAULT_GPU")) { g_default_gpu = e; fprintf(stderr, "[sa3-server] default GPU = %s\n", e); }
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
