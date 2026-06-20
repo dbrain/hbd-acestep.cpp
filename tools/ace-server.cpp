@@ -2646,6 +2646,16 @@ int main(int argc, char ** argv) {
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
+    // GPU residency announce for the koblem gate.
+    svr.Get("/v1/gpu/status", [](const httplib::Request &, httplib::Response & res) {
+        bool loaded; std::string gpu;
+        { std::lock_guard<std::mutex> lk(g_wk_mtx); loaded = g_wk_pid > 0; gpu = g_wk_gpu; }
+        std::string body = std::string("{\"loaded\":") + (loaded ? "true" : "false");
+        if (loaded && !gpu.empty()) body += ",\"gpu\":\"" + gpu + "\"";
+        else                        body += ",\"gpu\":null";
+        body += "}";
+        res.set_content(body, "application/json");
+    });
     svr.Get("/props", handle_props);
     svr.Get("/logs", handle_logs);
 
