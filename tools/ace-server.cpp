@@ -703,6 +703,31 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
     fprintf(stderr, "[Server] Job %s done (LM, %d results)\n", job->id.c_str(), lm_batch_size);
 }
 
+static void ace_set_next_gpu(const std::string & g);  // defined w/ the worker globals below
+
+// Per-request GPU target (multi-GPU scheduler): parse the top-level `gpu` field
+// from a request's JSON body and stash it for the next worker spawn. Shared by
+// /lm and /synth so BOTH phases honour the gate's placement (the LM phase is a
+// heavy VRAM step for the larger code-sketch models — it must not fall back to
+// the wrong card).
+static void ace_parse_gpu_target(const std::string & body) {
+    if (body.empty()) {
+        return;
+    }
+    yyjson_doc * gd = yyjson_read(body.c_str(), body.size(), 0);
+    if (!gd) {
+        return;
+    }
+    yyjson_val * gr = yyjson_doc_get_root(gd);
+    if (gr && yyjson_is_obj(gr)) {
+        yyjson_val * gv = yyjson_obj_get(gr, "gpu");
+        if (gv && yyjson_is_str(gv)) {
+            ace_set_next_gpu(yyjson_get_str(gv));
+        }
+    }
+    yyjson_doc_free(gd);
+}
+
 // POST /lm
 // accepts: AceRequest JSON (lm_mode in the body selects the generation mode).
 // returns: JSON {"id":"N"} immediately. result is a JSON array of enriched
@@ -727,6 +752,10 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
         json_error(res, 400, "Caption is required");
         return;
     }
+
+    // Honour the gate's per-request GPU placement for the LM phase too (the
+    // parent-side globals live further down, so route via the setter).
+    ace_parse_gpu_target(req.body);
 
     // Resolve lm_mode string to integer mode used by ace_lm_generate.
     int mode;
@@ -973,27 +1002,16 @@ static void synth_worker(std::shared_ptr<Job>    job,
 //   fed back to /vae decode.
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
-static void ace_set_next_gpu(const std::string & g);  // defined w/ the worker globals below
-
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
     if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
         json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
         return;
     }
 
-    // Per-request GPU target (gate placement): parse `gpu` from the JSON body
-    // (the parent-side globals live further down, so route via the setter).
-    if (!req.body.empty()) {
-        yyjson_doc * gd = yyjson_read(req.body.c_str(), req.body.size(), 0);
-        if (gd) {
-            yyjson_val * gr = yyjson_doc_get_root(gd);
-            if (gr && yyjson_is_obj(gr)) {
-                yyjson_val * gv = yyjson_obj_get(gr, "gpu");
-                if (gv && yyjson_is_str(gv)) ace_set_next_gpu(yyjson_get_str(gv));
-            }
-            yyjson_doc_free(gd);
-        }
-    }
+    // Per-request GPU target (gate placement): parse `gpu` from the JSON body.
+    // The multipart path (cover/repaint) carries the JSON in the `request` part
+    // instead, so it re-parses from `json_body` once extracted (below).
+    ace_parse_gpu_target(req.body);
 
     // parse request: plain JSON (single or array) or multipart (JSON + audio file or src_latents).
     // synth_model, lm_model, adapter, adapter_scale travel inside AceRequest now.
@@ -1024,6 +1042,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
             json_error(res, 400, "Multipart: invalid JSON in 'request' part");
             return;
         }
+        // The gate's placement rides in the `request` JSON, not the raw body.
+        ace_parse_gpu_target(json_body);
 
         // src_latents wins over audio when both are sent: a client that
         // already cached the latent skips the VAE encode regardless of
@@ -2433,6 +2453,14 @@ int main(int argc, char ** argv) {
             if (g_idle_unload_seconds < 0) {
                 g_idle_unload_seconds = 0;
             }
+        }
+        // Default card for worker spawns (multi-GPU scheduler). Read at startup so
+        // it's in place before the first spawn; the gate's per-request `gpu` field
+        // still overrides it. Without this the worker falls back to CUDA device 0.
+        const char * defgpu = std::getenv("WORKER_DEFAULT_GPU");
+        if (defgpu && *defgpu) {
+            g_default_gpu = defgpu;
+            fprintf(stderr, "[Server] WORKER_DEFAULT_GPU=%s (worker spawn default)\n", defgpu);
         }
     }
 #endif
