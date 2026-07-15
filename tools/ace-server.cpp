@@ -188,6 +188,10 @@ static ModelRegistry g_registry;
 // loaded model names (empty = nothing loaded)
 static std::string g_loaded_lm;
 static std::string g_loaded_dit;
+// Preferred default DiT (from ACE_DEFAULT_DIT env). Used as the registry fallback
+// before the alphabetical first-in-bucket, so adding a second DiT (e.g. the base
+// model, which sorts before turbo) doesn't silently flip the default.
+static std::string g_default_dit;
 static std::string g_loaded_adapter;
 static float       g_loaded_adapter_scale = 1.0f;
 static std::string g_loaded_und_dit;
@@ -596,12 +600,23 @@ static void json_error(httplib::Response & res, int status, const char * msg) {
 // resolve model name: explicit request > already loaded > first in bucket
 static std::string resolve_name(const std::vector<ModelEntry> & bucket,
                                 const std::string &             requested,
-                                const std::string &             loaded) {
+                                const std::string &             loaded,
+                                const std::string &             fallback = "") {
     if (!requested.empty()) {
         return requested;
     }
     if (!loaded.empty()) {
         return loaded;
+    }
+    // Preferred default (if configured and actually installed) before the
+    // alphabetical first-in-bucket. Keeps the intended default stable when a
+    // model that sorts earlier is added to the registry.
+    if (!fallback.empty()) {
+        for (const auto & e : bucket) {
+            if (e.name == fallback) {
+                return fallback;
+            }
+        }
     }
     if (!bucket.empty()) {
         return bucket[0].name;
@@ -826,7 +841,7 @@ static void synth_worker(std::shared_ptr<Job>    job,
     }
 
     // Resolve DiT, adapter, VAE and the text-encoder singleton.
-    std::string        dit_name = resolve_name(g_registry.dit, ace_reqs[0].synth_model, g_loaded_dit);
+    std::string        dit_name = resolve_name(g_registry.dit, ace_reqs[0].synth_model, g_loaded_dit, g_default_dit);
     const ModelEntry * dit      = registry_find(g_registry.dit, dit_name.c_str());
     if (!dit) {
         fprintf(stderr, "[Server] DiT not found: %s\n", dit_name.c_str());
@@ -1180,7 +1195,7 @@ static void understand_worker(std::shared_ptr<Job> job,
 
     // Resolve LM + DiT (the DiT path carries the tokenizer weights) + VAE.
     std::string        lm_name   = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
-    std::string        dit_name  = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit);
+    std::string        dit_name  = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit, g_default_dit);
     std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
     const ModelEntry * lm_entry  = registry_find(g_registry.lm, lm_name.c_str());
     const ModelEntry * dit       = registry_find(g_registry.dit, dit_name.c_str());
@@ -2461,6 +2476,13 @@ int main(int argc, char ** argv) {
         if (defgpu && *defgpu) {
             g_default_gpu = defgpu;
             fprintf(stderr, "[Server] WORKER_DEFAULT_GPU=%s (worker spawn default)\n", defgpu);
+        }
+        // Preferred default DiT (registry fallback before alphabetical bucket[0]).
+        // Keeps turbo the default even when the base DiT (sorts earlier) is present.
+        const char * defdit = std::getenv("ACE_DEFAULT_DIT");
+        if (defdit && *defdit) {
+            g_default_dit = defdit;
+            fprintf(stderr, "[Server] ACE_DEFAULT_DIT=%s (registry default)\n", defdit);
         }
     }
 #endif
